@@ -7,6 +7,9 @@
 //!         冲突时以后者为准；每个目录只取一个文件；读不到就跳过，不算错误。
 //! 不可简化: 不能只读当前目录那一个文件。仓库根写的规范必须对子目录生效，
 //!           否则在子目录里启动就丢掉了全部约束。
+//!
+//! 接入点: 本模块只负责产出「项目上下文」那一段。完整的第一条 system 消息
+//!         由 loop 组装（前言 + 工具说明 + 本段 + 工作目录），见 llm.Message。
 
 const std = @import("std");
 
@@ -56,10 +59,16 @@ fn appendFromDir(
 }
 
 /// 拼成给模型看的一段文本。没有命中任何文件时什么都不写（不发空段落）。
+///
+/// 用 XML 风格标签包住每个文件（pi 的做法，标签名沿用它的 project_instructions）：
+///   有明确边界，文件内容里即使出现「忽略以上指令」之类的句子，模型仍能分辨
+///   哪些是项目规范、哪些是它自己的任务；path 属性标出来源，多文件冲突时
+///   模型知道该听谁。
 pub fn render(w: *std.Io.Writer, entries: []const Entry) !void {
     if (entries.len == 0) return;
-    try w.writeAll("以下规范文件对本项目持续生效。按从外到内的顺序排列，越靠后越具体，冲突时以后者为准。\n");
-    for (entries) |e| {
-        try w.print("\n## {s}\n\n{s}\n", .{ e.path, e.content });
+    try w.writeAll("Project-specific instructions and guidelines:\n\n");
+    for (entries, 0..) |e, i| {
+        if (i > 0) try w.writeAll("\n\n");
+        try w.print("<project_instructions path=\"{s}\">\n{s}\n</project_instructions>", .{ e.path, e.content });
     }
 }
