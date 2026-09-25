@@ -31,6 +31,7 @@ const tools = @import("agent/tools.zig");
 const context_files = @import("agent/context_files.zig");
 const llm = @import("agent/llm.zig");
 const loop_mod = @import("agent/loop.zig");
+const session_log = @import("agent/session_log.zig");
 
 pub fn main(init: std.process.Init) !void {
     // 进程级 arena：活到进程结束的东西放这里
@@ -101,7 +102,34 @@ fn runAgent(
         .dir = std.Io.Dir.cwd(),
     };
 
-    var lp = try loop_mod.Loop.init(gpa, arena, io, std.Io.Dir.cwd(), &client, &session, &host, .{});
+    // 会话日志：建不了就无日志继续跑 —— 记录是辅助，不该挡住对话
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+
+    var log: ?session_log.Log = null;
+    if (env.get("HOME")) |home| {
+        const base = try std.fmt.allocPrint(gpa, "{s}/.dsh/sessions", .{home});
+        defer gpa.free(base);
+        if (session_log.Log.create(gpa, io, base, cwd, client.cfg.model)) |l| {
+            log = l;
+            std.debug.print("[log] 会话记录：{s}\n", .{log.?.path});
+        } else |e| {
+            std.debug.print("[log] 无法建会话日志（{s}），本次不记录\n", .{@errorName(e)});
+        }
+    }
+    defer if (log) |*l| l.close();
+
+    var lp = try loop_mod.Loop.init(
+        gpa,
+        arena,
+        io,
+        std.Io.Dir.cwd(),
+        &client,
+        &session,
+        &host,
+        if (log) |*l| l else null,
+        .{},
+    );
     defer lp.deinit();
 
     if (once) |text| {

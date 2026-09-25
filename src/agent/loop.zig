@@ -19,6 +19,7 @@ const std = @import("std");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const context_files = @import("context_files.zig");
+const session_log = @import("session_log.zig");
 
 pub const Config = struct {
     /// 单次输入最多允许几轮「请求 + 工具」往返
@@ -35,6 +36,8 @@ pub const Loop = struct {
     client: *llm.Client,
     session: *llm.Session,
     host: *tools.Host,
+    /// 会话日志（可为 null：记录不是硬依赖）
+    log: ?*session_log.Log = null,
     tools_json: []const u8,
     system_prompt: []const u8,
     cfg: Config,
@@ -48,24 +51,32 @@ pub const Loop = struct {
         client: *llm.Client,
         session: *llm.Session,
         host: *tools.Host,
+        log: ?*session_log.Log,
         cfg: Config,
     ) !Loop {
         // 工具清单与 system 提示只组装一次 —— 它们在一次会话里不会变
         const tools_json = try tools.jsonSpec(session_arena);
         const system_prompt = try buildSystemPrompt(session_arena, io, dir);
 
-        return .{
+        const self = Loop{
             .gpa = gpa,
             .session_arena = session_arena,
             .io = io,
             .client = client,
             .session = session,
             .host = host,
+            .log = log,
             .tools_json = tools_json,
             .system_prompt = system_prompt,
             .cfg = cfg,
             .tool_buf = try gpa.alloc(u8, cfg.tool_output_bytes),
         };
+
+        // system 消息也要落到日志里：复盘时得知道当时到底喂了什么
+        if (self.log) |lg| {
+            lg.appendMessage(.{ .role = .system, .content = system_prompt }, 0, 0);
+        }
+        return self;
     }
 
     pub fn deinit(self: *Loop) void {
@@ -74,10 +85,10 @@ pub const Loop = struct {
 
     /// 跑完一轮用户输入。返回后 Session 里已经记录了这一轮的全部往返。
     pub fn runTurn(self: *Loop, user_text: []const u8) !void {
-        try self.session.append(.{
+        try self.record(.{
             .role = .user,
             .content = try self.session_arena.dupe(u8, user_text),
-        });
+        }, 0, 0);
 
         var round: u32 = 0;
         while (round < self.cfg.max_rounds) : (round += 1) {
@@ -91,25 +102,36 @@ pub const Loop = struct {
             if (done.text.len > 0) std.debug.print("{s}\n", .{done.text});
 
             // assistant 这一轮同样要进历史，且 tool_calls 必须原样保留
-            try self.session.append(.{
+            try self.record(.{
                 .role = .assistant,
                 .content = try self.session_arena.dupe(u8, done.text),
                 .tool_calls = try self.keepToolCalls(done.tool_calls),
-            });
+            }, done.prompt_tokens, done.completion_tokens);
 
             if (!done.wantsTools()) return;
 
             for (done.tool_calls) |call| {
                 const result = try self.runTool(ta, call);
-                try self.session.append(.{
+                try self.record(.{
                     .role = .tool,
                     .tool_call_id = try self.session_arena.dupe(u8, call.id),
                     .content = result,
-                });
+                }, 0, 0);
             }
         }
 
         std.debug.print("[loop] 已达 {d} 轮上限，停止本轮（防模型反复调工具）\n", .{self.cfg.max_rounds});
+    }
+
+    /// 追加一条消息：进内存历史 + 落日志。所有消息都走这里，不会有只落一边的路径。
+    fn record(
+        self: *Loop,
+        m: llm.Message,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) !void {
+        try self.session.append(m);
+        if (self.log) |lg| lg.appendMessage(m, prompt_tokens, completion_tokens);
     }
 
     /// 执行一个工具调用，返回可长期保存（已拷进 session arena）的结果文本。
@@ -223,7 +245,7 @@ const TestEnv = struct {
         self.client = llm.Client.init(arena, .{}, "fake-key", replay.asTransport());
         // 参数是 *TestEnv 而不是返回值：Loop 里存的是 &self.client 这类指针，
         // TestEnv 一旦被拷贝（返回结构体值），这些指针就悬空了。
-        self.loop = try Loop.init(gpa, arena, io, std.Io.Dir.cwd(), &self.client, &self.session, &self.host, .{});
+        self.loop = try Loop.init(gpa, arena, io, std.Io.Dir.cwd(), &self.client, &self.session, &self.host, null, .{});
     }
 
     fn deinit(self: *TestEnv) void {

@@ -6,6 +6,9 @@
 //       · 超时: Io.Clock.Duration 是 { raw: Io.Duration, clock: Io.Clock }，clock 用 .awake
 //                （没有 .monotonic；Io.Duration 有 fromSeconds 等构造器）
 //       · 超时触发时 run 返回 error.Timeout（不是返回一个"被 kill"的 term）
+//       · 在测试里起子进程要用 std.testing.io（专供测试的 Io.Threaded 实例）；
+//         用 std.Options.debug_io 会让 run 直接失败（bash 工具返回 err_internal），
+//         这是被一次真实测试逮到的
 // 怎么复现: zig build-exe fs_and_process.zig -lc -femit-bin=fs_and_process && ./fs_and_process
 const std = @import("std");
 
