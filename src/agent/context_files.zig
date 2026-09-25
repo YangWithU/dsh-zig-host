@@ -72,3 +72,33 @@ pub fn render(w: *std.Io.Writer, entries: []const Entry) !void {
         try w.print("<project_instructions path=\"{s}\">\n{s}\n</project_instructions>", .{ e.path, e.content });
     }
 }
+
+test "render: 每个文件包在 project_instructions 里，外层在前" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const entries = [_]Entry{
+        .{ .path = "/repo/AGENTS.md", .content = "# 根" },
+        .{ .path = "/repo/sub/AGENTS.md", .content = "# 子" },
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    try render(&aw.writer, &entries);
+    const out = aw.written();
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "Project-specific instructions and guidelines:"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "<project_instructions path=\"/repo/AGENTS.md\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<project_instructions path=\"/repo/sub/AGENTS.md\">") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "</project_instructions>"));
+
+    const root_at = std.mem.indexOf(u8, out, "/repo/AGENTS.md").?;
+    const sub_at = std.mem.indexOf(u8, out, "/repo/sub/AGENTS.md").?;
+    try std.testing.expect(root_at < sub_at);
+}
+
+test "render: 没有文件时不产出任何内容" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try render(&aw.writer, &.{});
+    try std.testing.expectEqual(@as(usize, 0), aw.written().len);
+}

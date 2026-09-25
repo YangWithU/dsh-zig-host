@@ -101,4 +101,16 @@ pub fn build(b: *std.Build) void {
     const abi_tests = b.addTest(.{ .root_module = abi_mod });
     const test_step = b.step("test", "运行测试");
     test_step.dependOn(&b.addRunArtifact(abi_tests).step);
+
+    // agent 目录的测试（MVP 部分）。各文件的 test 由 tests.zig 聚合。
+    const agent_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "dsh_abi", .module = abi_mod },
+        },
+    });
+    agent_test_mod.link_libc = true;
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = agent_test_mod })).step);
 }
