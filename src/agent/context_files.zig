@@ -1,0 +1,65 @@
+//! 收集 AGENTS.md：当前目录 + 所有父目录，作为对话开头的规范。
+//!
+//! 职责: 让模型一上来就知道这个仓库在哪、怎么构建、有哪些规矩。
+//! 数据流: main -> collect() 从工作目录逐级向上找文件 -> render() 拼成一段文本
+//!         -> 作为第一条 system 消息的第一段。
+//! 不变量: 顺序为「从最外层到最内层」，内层在后 —— 越具体的指令越晚出现，
+//!         冲突时以后者为准；每个目录只取一个文件；读不到就跳过，不算错误。
+//! 不可简化: 不能只读当前目录那一个文件。仓库根写的规范必须对子目录生效，
+//!           否则在子目录里启动就丢掉了全部约束。
+
+const std = @import("std");
+
+/// 每个目录按这个顺序找，取第一个命中的。
+/// override 让「临时覆盖」不必改动原文件（删掉即恢复），这一条值得留。
+const candidates = [_][]const u8{ "AGENTS.override.md", "AGENTS.md" };
+
+/// 单个文件的大小上限，防止一个巨型文件把上下文灌满。
+const max_file_bytes: usize = 64 * 1024;
+
+pub const Entry = struct {
+    path: []const u8,
+    content: []const u8,
+};
+
+/// 从工作目录逐级向上收集，返回顺序为「最外层在前、工作目录自己在最后」。
+pub fn collect(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]Entry {
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+
+    var list: std.ArrayList(Entry) = .empty;
+    var current: ?[]const u8 = cwd;
+    while (current) |d| {
+        try appendFromDir(gpa, io, dir, d, &list);
+        current = std.fs.path.dirname(d);
+    }
+
+    // 上面是从内层往外收集的，反转成「外层在前」，让更具体的规则出现在后面。
+    std.mem.reverse(Entry, list.items);
+    return list.toOwnedSlice(gpa);
+}
+
+fn appendFromDir(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    d: []const u8,
+    list: *std.ArrayList(Entry),
+) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (candidates) |name| {
+        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ d, name }) catch continue;
+        // 读不到就当这个目录没有它：缺 AGENTS.md 是完全正常的情况
+        const content = dir.readFileAlloc(io, path, gpa, .limited(max_file_bytes)) catch continue;
+        try list.append(gpa, .{ .path = try gpa.dupe(u8, path), .content = content });
+        return; // 一个目录只取一个文件
+    }
+}
+
+/// 拼成给模型看的一段文本。没有命中任何文件时什么都不写（不发空段落）。
+pub fn render(w: *std.Io.Writer, entries: []const Entry) !void {
+    if (entries.len == 0) return;
+    try w.writeAll("以下规范文件对本项目持续生效。按从外到内的顺序排列，越靠后越具体，冲突时以后者为准。\n");
+    for (entries) |e| {
+        try w.print("\n## {s}\n\n{s}\n", .{ e.path, e.content });
+    }
+}

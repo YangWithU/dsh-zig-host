@@ -1,75 +1,135 @@
 //! ═══════════════════════════════════════════════════════════════════════════
-//!  dsh_zig —— 用 Zig 复刻 Cordis 内核 + 最小 agent    【草图 / 空壳】
+//!  dsh_zig —— Zig 版 Cordis 内核 + 最小 agent
 //! ═══════════════════════════════════════════════════════════════════════════
 //!
-//! 这个文件是**骨架的骨架**：它把五个阶段串成一条调用链，让整个设计
-//! 的结构一眼可见。所有被调用的函数都是 TODO 占位，跑起来会 panic，
-//! 但**类型检查是通过的** —— 这本身就验证了各模块之间的契约成立。
+//! 当前进度：**MVP 优先**。插件机制（阶段 1–4）仍是空壳，先把能跑的东西做出来。
 //!
-//! 五阶段与文件对应
-//! ---------------------------------------------------------------------------
-//!   阶段 1  动态装卸闭环      src/host/fiber.zig      src/host/loader.zig
-//!            abi 契约          src/abi.zig           src/plugins/hello.zig
-//!   阶段 2  服务表 + 依赖门   src/host/services.zig
-//!   阶段 3  事件总线          src/host/events.zig
-//!   阶段 4  热重载闭环        src/host/hotreload.zig
-//!   阶段 5  agent + 四工具    src/agent/llm.zig      src/agent/loop.zig
-//!            src/plugins/tools.zig
-//!   装配     宿主门面         src/host/context.zig
+//!     dsh_zig                                   REPL：与模型对话，模型可调四个工具
+//!     dsh_zig "帮我看看 xxx"                    单轮提问
+//!     dsh_zig --tool bash '{"command":"ls"}'    直接调一个工具（不联网，用于验证）
 //!
-//! 主线（记住这一条就够了）
-//! ---------------------------------------------------------------------------
-//!   建宿主 ctx  →  挂插件(.so)  →  插件注册服务/监听  →  agent 跑轮次
-//!                    ↑                                      │
-//!                    └──── 源码变了就重新编译并热替换 ←───────┘
+//! 为什么先做 MVP 而不是先做插件：
+//!   · 网络通路与 agent 循环是「只能靠真跑才知道」的风险，必须提前消掉
+//!     （Zig 0.16 的 HTTP/TLS/文件/进程 API 与所有 0.11–0.15 教程都不兼容）；
+//!   · 工具四件套本身就是将来第一个真实插件，用它来验插件机制比造 mock 强。
 //!
-//! ⚠️ 这是草图。所有函数体是 @panic("TODO")，不含实现。
+//! 五阶段与文件
+//!   阶段 1  动态装卸闭环  host/fiber.zig   host/loader.zig   plugins/hello.zig
+//!   阶段 2  服务表+依赖门 host/services.zig
+//!   阶段 3  事件总线      host/events.zig
+//!   阶段 4  热重载闭环    host/hotreload.zig
+//!   阶段 5  agent+四工具  agent/llm.zig  agent/loop.zig  agent/tools.zig
+//!   装配                  host/context.zig（阶段 1–3）、本文件
+//!
+//! 插件装配路径见文件末尾 `runWithPlugins`：故意不调用（理由见其注释）。
 
 const std = @import("std");
 const abi = @import("dsh_abi");
 const Context = @import("host/context.zig").Context;
-const loader = @import("host/loader.zig");
 const hotreload = @import("host/hotreload.zig");
-const llm = @import("agent/llm.zig");
-const agent_loop = @import("agent/loop.zig");
+const tools = @import("agent/tools.zig");
+const context_files = @import("agent/context_files.zig");
 
 pub fn main(init: std.process.Init) !void {
     // 进程级 arena：活到进程结束的东西放这里
     const gpa = init.arena.allocator();
     const io = init.io;
+    const args = init.minimal.args.toSlice(gpa) catch &.{};
 
+    // ── dsh_zig --tool <名字> '<json 参数>' ────────────────────────────────
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--tool")) {
+        const json: []const u8 = if (args.len >= 4) args[3] else "{}";
+        try runToolCli(gpa, io, args[2], json);
+        return;
+    }
+
+    // ── dsh_zig --context   打印启动时会注入 system 消息的规范文本 ─────────
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "--context")) {
+        try runContextCli(gpa, io);
+        return;
+    }
+
+    // TODO(下一步): REPL / 单轮对话 —— 走 agent/loop.zig
+    std.debug.print(
+        \\MVP 施工中，已可用的入口：
+        \\  dsh_zig --context                              看会被注入的规范（AGENTS.md）
+        \\  dsh_zig --tool read  '{{"path":"build.zig","limit":5}}'
+        \\  dsh_zig --tool bash  '{{"command":"ls src"}}'
+        \\  dsh_zig --tool write '{{"path":"/tmp/x.txt","content":"hi"}}'
+        \\  dsh_zig --tool edit  '{{"path":"/tmp/x.txt","oldText":"hi","newText":"bye"}}'
+        \\
+    , .{});
+}
+
+/// 打印启动时会作为第一条 system 消息注入的规范文本。
+/// 单猬一个入口是为了能脱离 LLM 验证「找到了哪些文件、拼成了什么样」。
+fn runContextCli(gpa: std.mem.Allocator, io: std.Io) !void {
+    const entries = try context_files.collect(gpa, io, std.Io.Dir.cwd());
+
+    if (entries.len == 0) {
+        std.debug.print("未找到任何 AGENTS.md（从工作目录向上逐级查找）\n", .{});
+        return;
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try context_files.render(&aw.writer, entries);
+
+    std.debug.print("命中 {d} 个文件：\n", .{entries.len});
+    for (entries) |e| std.debug.print("  {s}  ({d} 字节)\n", .{ e.path, e.content.len });
+    std.debug.print("\n---- 注入内容预览 ----\n{s}\n", .{aw.written()});
+}
+
+/// 直接调用一个工具并打印结果。**不联网、不花钱**，专门用来独立验证四件套。
+///
+/// 存在的意义：工具的正确性不该等到 LLM 接上才能验证 —— 那会把两类错误
+/// （工具写错了 / 接线接错了）混在一起，最难查。
+fn runToolCli(gpa: std.mem.Allocator, io: std.Io, name: []const u8, args_json: []const u8) !void {
+    const t = tools.find(name) orelse {
+        std.debug.print("未知工具：{s}（可用：read / write / edit / bash）\n", .{name});
+        return;
+    };
+
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+
+    var host = tools.Host{
+        .gpa = gpa,
+        .scratch = scratch.allocator(),
+        .io = io,
+        .dir = std.Io.Dir.cwd(),
+    };
+
+    const buf = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(buf);
+    var out = tools.Buffer{ .ptr = buf.ptr, .cap = buf.len };
+
+    // 命令行给的是 Zig 风格的 slice，工具签名要 [*:0]const u8（将来跨 ABI 的形态）
+    const args_z = try gpa.dupeZ(u8, args_json);
+    defer gpa.free(args_z);
+
+    const status = t.exec(&host, args_z.ptr, &out);
+    std.debug.print("[{s} -> {s}]\n{s}", .{ name, @tagName(status), out.slice() });
+}
+
+/// 插件装配路径（阶段 1–4 的产物在这里被缝到一起）。
+///
+/// MVP 阶段故意不调用：Context.init 等仍是 @panic("TODO")，调它必崩。
+/// 留在这里是为了让「宿主 -> 插件 -> agent」的装配关系不丢，等阶段 1–3
+///    实现后由 main 按开关切回来；届时 agent 循环直接复用 MVP 的 loop。
+fn runWithPlugins(gpa: std.mem.Allocator, io: std.Io) !void {
     // ── 装配宿主（阶段 1–3 的产物在这里被缝到一起） ───────────────────────
     var ctx = Context.init(gpa, io);
     defer ctx.deinit();
 
-    // ── 阶段 1：挂一个内置/外部插件，验证装卸闭环 ────────────────────────
+    // ── 阶段 1：挂一个插件，验证装卸闭环 ─────────────────────────────────
     //   内置插件：路径为 null，代码编译进宿主
-    //   外部插件：指向 .so，运行时 dlopen
-    //   （路径对应 build.zig 里 addLibrary 的产物：zig-out/lib/lib<name>.so）
+    //   外部插件：指向 .so，运行时 dlopen（产物名带指纹，见 hotreload.PluginSpec）
     const tools_plugin = try ctx.mountPlugin("zig-out/lib/libtools.so", "{}");
     defer ctx.unmountPlugin(tools_plugin);
 
-    // ── 阶段 5：建 agent 循环 ────────────────────────────────────────────
-    var client = llm.Client.init(gpa, io, .{});
-    defer client.deinit();
-
-    var session = llm.Session.init(gpa);
-    defer session.deinit();
-
-    var loop = agent_loop.Loop.init(gpa, .{
-        .client = &client,
-        .get_tools = &Context.cGetTools,
-        .emit = &Context.cEmit,
-        .ctx = ctx.handle(),
-    }, session);
-
-    // ── 主流程：跑一个轮次 ───────────────────────────────────────────────
-    const args = init.minimal.args.toSlice(gpa) catch &.{};
-    const prompt: []const u8 = if (args.len > 1) args[1] else "hello";
-    try loop.runTurn(prompt);
-
-    // ── 阶段 4：进入热重载监视循环（可选，用 --watch 开启） ───────────────
-    //   每轮：poll 源码变化 → 重新编译 → 撤销旧注册 → dlopen 新实现
+    // ── 阶段 4：热重载监视 ───────────────────────────────────────────────
+    //   每轮：poll → compile（新文件名）→ inspect → 拆旧 → 装新 → 重放依赖
     var watcher = hotreload.Watcher.init(gpa, &.{"src/plugins"});
     var spec = hotreload.PluginSpec{
         .source_path = "src/plugins/tools.zig",
