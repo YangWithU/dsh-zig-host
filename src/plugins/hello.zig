@@ -22,7 +22,8 @@ pub export fn dsh_plugin_abi_version() callconv(.c) u32 {
     @panic("TODO: 阶段 1 —— 返回 abi.ABI_VERSION");
 }
 
-/// 记录本实例注册过的句柄，供卸载时对照检查（诊断用）。
+/// 记录本实例注册过的句柄 —— **纯诊断用**，不是卸载所需。
+/// 卸载由宿主按自己的撤销清单完成，插件丢不丢这些句柄都不影响清理干净。
 var g_state: struct {
     api: ?*const abi.HostApi = null,
     svc_handle: abi.Handle = abi.INVALID_HANDLE,
@@ -63,8 +64,14 @@ pub export fn dsh_plugin_init(api: *const abi.HostApi, config_json: [*:0]const u
     @panic("TODO: 阶段 1 —— 校验 ABI → 分配 → 注册服务 → 注册监听");
 }
 
-/// 可选导出：主动收尾钩子。
-/// 正常情况下宿主靠「撤销注册 + arena 释放」就够，这里只做打印，验证时序。
+/// 可选导出：主动收尾钩子（这个插件**不需要**它）。
+///
+/// 它注册的东西（一个服务 + 一个监听）全部经由 HostApi，卸载时由**宿主**
+/// 按撤销清单撤掉，arena 也由宿主清空。这里只留一个打印，用来验证卸载时序
+/// （它必须发生在 dlclose 之前）。
+///
+/// 什么插件才真需要它：绕开 HostApi 自己搞了外部资源（起了线程、开了文件、
+/// 注册了系统信号）的那些 —— 宿主不知道这些，只能由插件自己收尾。
 pub export fn dsh_plugin_deinit() callconv(.c) void {
     @panic("TODO: 阶段 1 —— 打印 'deinit'，用于确认卸载时序");
 }

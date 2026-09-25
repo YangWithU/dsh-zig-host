@@ -34,6 +34,10 @@ const fiber_mod = @import("fiber.zig");
 
 /// 一条服务实现记录。
 pub const ServiceEntry = struct {
+    /// 稳定编号，由 Registry 分配（等同 Handle.id）。
+    /// ★ 撤销只按它定位，不按 (name, scope) 找行 —— 重复注册时按名字会撤错行。
+    id: u64 = 0,
+
     name: []const u8,
     scope: u64 = 0,
 
@@ -60,6 +64,10 @@ pub const Registry = struct {
     /// 键是 (name, scope) 的组合。草图先用字符串键 + scope 并存的条目表。
     entries: std.ArrayList(ServiceEntry),
 
+    /// 下一个待分配的条目编号。单调递增，**永不复用**
+    /// （id 一旦回收再利用，握在插件手里的旧 handle 就会复活并指向别人）。
+    next_id: u64 = 1,
+
     /// 依赖索引：服务名 → 依赖它的 fiber 列表。
     /// 服务变化时靠它做定向通知，不必遍历全表。
     /// （Cordis 是遍历所有 fiber 逐个检查 inject，Zig 里有更省的写法。）
@@ -75,27 +83,33 @@ pub const Registry = struct {
         @panic("TODO: 阶段 2");
     }
 
-    /// 注册服务。同名同 scope 已存在 → 返回 err_duplicate。
+    /// 注册服务：分配编号 → 入表（记 owner）→ 返回 Handle。
+    /// 同名同 scope 已存在 → 返回 abi.INVALID_HANDLE（不覆盖、不静默替换）。
     ///
-    /// 调用方（宿主侧的 HostApi.register_service）会**同时**在提供者 fiber
-    /// 的撤销清单里登记一条撤销项，从而保证提供者卸载时服务自动消失。
-    /// 这两步必须成对出现。
-    pub fn provide(self: *Registry, e: ServiceEntry) abi.Status {
+    /// ★ 调用方（宿主侧的 HostApi.register_service）**必须同时**在提供者
+    ///   fiber 的撤销清单里登记一条「按这个编号撤销」的项，从而保证提供者
+    ///   卸载时服务自动消失。这两步成对，缺一个就是卸载后段错误。
+    ///   ⇒ 注册与撤销的配对责任在宿主，不在插件。
+    pub fn provide(self: *Registry, e: ServiceEntry) abi.Handle {
         _ = self;
         _ = e;
         @panic("TODO: 阶段 2 —— 查重 → 入表 → 建索引 → 通知依赖者");
     }
 
     /// 撤销服务（由 fiber 的撤销清单在卸载时调用）。
-    pub fn revoke(self: *Registry, name: []const u8, scope: u64, owner: *fiber_mod.Fiber) void {
+    /// 按编号定位那一行并摘除，然后通知依赖者重算状态。
+    /// generation 对不上 = 这条早就被撤过了 → 静默返回（幂等）。
+    pub fn revoke(self: *Registry, id: u64, generation: u32, owner: *fiber_mod.Fiber) void {
         _ = self;
-        _ = name;
-        _ = scope;
+        _ = id;
+        _ = generation;
         _ = owner;
         @panic("TODO: 阶段 2 —— 摘除 + 通知依赖者重算");
     }
 
     /// 查服务接口表。返回 null = 当前不可用（不是错误）。
+    /// 返回前必须校验持有者 fiber 还处于 active —— 提供者一旦进入 unloading/
+    /// disposed，它表里的 impl 指针会随着 arena 清空而失效。
     ///
     /// ★ 这里就是 Cordis `ctx.tools` 的对应物。区别是 Zig 必须显式 cast：
     ///     const raw = reg.get("tools", 0) orelse return;

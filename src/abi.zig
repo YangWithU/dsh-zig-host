@@ -47,11 +47,17 @@ pub const Status = enum(c_int) {
     err_internal = 7,
 };
 
-/// 注册句柄。
+/// 注册句柄。**id 由宿主分配，注册时返回给注册方。**
+///
+/// ★ 撤销一律按 id 定位，**不按名字**：同一个插件可以对同一事件注册多个
+///   监听，也可以在不同 scope 注册同名服务 —— 按名字撤销必然撤错行。
+///   ⇒ 宿主每个注册条目占一个稳定编号，撤销项里存的就是这个编号。
 ///
 /// 为什么要 generation：卸载后旧的句柄仍然可能被插件握在手里，
 /// 只用 id 会误命中「重新加载后复用了同一 id」的新注册（ABA 问题）。
 /// 撤销时递增 generation，旧句柄自然失效。
+///
+/// 编号在同一个 fiber 存续期内不复用；fiber 销毁后它那批编号整体作废。
 pub const Handle = extern struct {
     id: u64 = 0,
     generation: u32 = 0,
@@ -105,6 +111,11 @@ pub const DispatchMode = enum(c_int) {
 /// 这是 Zig 相对 Cordis 的最大简化：Cordis 要靠 disposer 链表 + 异步等待
 /// 保证不泄漏；Zig 里 arena.deinit() 一把清空，泄漏在物理上不可能。
 /// 代价：插件无法在卸载后保留内存（本来也不该）。
+///
+/// ⚠️ 由此推出一条硬规则：**这块内存不得跨边界长期外借**。
+///   插件从这里切一块交给宿主长期持有（比如工具返回的结果字符串），
+///   插件一卸载 arena 整体清空 → 宿主手里那块当场悬空。
+///   跨边界、宿主之后还要用的内存，必须由宿主自己分配并提供。
 pub const AllocFn = *const fn (host_ctx: *anyopaque, len: usize, alignment: u32) callconv(.c) ?*anyopaque;
 
 pub const LogFn = *const fn (host_ctx: *anyopaque, level: LogLevel, msg: [*:0]const u8) callconv(.c) void;
@@ -134,10 +145,17 @@ pub const OnEventFn = *const fn (
     cb: Callback,
 ) callconv(.c) Handle;
 
-/// 撤销任意注册（服务 / 监听器 ……）。
+/// 撤销任意注册（服务 / 监听器 ……）。按 Handle.id 定位，不按名字。
 ///
 /// ★ 这是整套体系里最重要的一个函数。
-///   插件卸载前必须撤销自己全部的注册。实测：漏掉一个 → 段错误。
+///
+/// ★ 谁负责：**宿主负责，插件不负责**（基调，不要改成「插件自觉清理」）。
+///   注册发生的那一刻宿主就知道「收到了什么」，它顺手把「怎么撤掉它」记进
+///   调用者 fiber 的撤销清单。于是插件忘了、init 半路失败、插件崩了，
+///   都不影响宿主把自己恢复干净 —— 安全不建立在插件的正确性上。
+///   插件调这个函数只有一个用途：**主动提前撤销**（可选能力）。
+///
+/// 语义：幂等。同一个 handle 撤两次，第二次返回 err_not_found，不崩。
 pub const RevokeFn = *const fn (host_ctx: *anyopaque, handle: Handle) callconv(.c) Status;
 
 /// 宿主给插件的全部能力。插件**只能**通过这个结构触达宿主。
@@ -174,8 +192,15 @@ pub const PluginAbiVersionFn = *const fn () callconv(.c) u32;
 /// 实现约定：在 init 里完成全部注册，并保证每一项都有对应的撤销路径。
 pub const PluginInitFn = *const fn (api: *const HostApi, config_json: [*:0]const u8) callconv(.c) Status;
 
-/// 插件可选导出：主动清理钩子。
-/// 正常情况下宿主靠撤销注册 + arena 释放就够；这个留给需要特殊收尾的插件。
+/// 插件**可选**导出：主动收尾钩子。
+///
+/// 责任边界（一句话）：**经由 HostApi 注册的东西由宿主撤；绕开 HostApi 自己
+/// 搞的东西（起了线程、开了文件、注册了系统信号）只有插件知道，插件自己收。**
+/// 一个规矩使用 HostApi 的插件不需要导出它（hello 就不需要）。
+///
+/// ⚠️ 宿主**不得依赖**它：它是在卸载过程中被调用的插件代码，插件在里面 panic
+///   或死循环会把宿主一起带走，而且此时 .so 还没卸。
+///   它是「给插件一个善后的机会」，不是「宿主清理工作的依赖」。
 pub const PluginDeinitFn = *const fn () callconv(.c) void;
 
 /// dlsym 用的符号名常量（避免字符串散落各处写错）。

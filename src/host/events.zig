@@ -42,6 +42,11 @@ const fiber_mod = @import("fiber.zig");
 
 /// 一条监听记录。
 pub const Listener = struct {
+    /// 稳定编号，由 Bus 分配（等同 Handle.id）。
+    /// ★ 撤销按编号定位：同一个插件可以对同一事件注册多个监听，
+    ///   按事件名撤销会把不属于自己的那几条一起撤掉。
+    id: u64 = 0,
+
     /// 事件名
     event: []const u8,
     mode: abi.DispatchMode,
@@ -60,6 +65,9 @@ pub const Bus = struct {
     /// 事件名 → 监听器列表（按注册顺序）。
     listeners: std.StringHashMap(std.ArrayList(Listener)),
 
+    /// 下一个待分配的监听编号。单调递增，永不复用。
+    next_id: u64 = 1,
+
     /// 关闭「递归分发」的护栏。事件处理里再发同类事件容易写出无限递归，
     /// 这里用一个深度计数挡住（JS 里靠栈溢出才发现，Zig 里直接崩）。
     depth: u32 = 0,
@@ -75,17 +83,19 @@ pub const Bus = struct {
         @panic("TODO: 阶段 3");
     }
 
-    /// 注册监听。
+    /// 注册监听：分配编号 → 入表（记 owner）→ 返回 Handle。
     ///
-    /// ★ 宿主侧还必须把「撤销这条监听」登记进 owner fiber 的撤销清单，
-    ///   两步成对。否则插件卸载后监听还在 → 段错误。
+    /// ★ 宿主侧**必须同时**把「按这个编号撤销这条监听」登记进 owner fiber
+    ///   的撤销清单，两步成对（责任在宿主，不在插件）。
+    ///   否则插件卸载后这条监听还在，回调地址指向已卸载的代码 → 段错误。
     pub fn on(self: *Bus, l: Listener) abi.Handle {
         _ = self;
         _ = l;
         @panic("TODO: 阶段 3 —— 入表（按 prepend 决定位置）");
     }
 
-    /// 撤销监听（由 fiber 的撤销清单调用）。
+    /// 撤销监听（由 fiber 的撤销清单调用，插件也可主动调）。
+    /// 按 Handle.id 定位那一行；generation 对不上说明早已撤过 → 幂等返回。
     pub fn off(self: *Bus, h: abi.Handle) abi.Status {
         _ = self;
         _ = h;

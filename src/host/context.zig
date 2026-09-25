@@ -106,8 +106,16 @@ pub const Context = struct {
 
     /// HostApi.register_service 的实现。
     ///
-    /// 关键：**同时**在提供者 fiber 的撤销清单里登记一条撤销项。
+    /// 三步，顺序固定：
+    ///   ① registry.provide() —— 分配编号、入表、记 owner
+    ///   ② 用**宿主分配器**造一条撤销项（存编号，不存名字），追加到
+    ///      **调用者这个 fiber** 的撤销清单里
+    ///   ③ 通知等在服务上的 fiber 重算状态
     /// 「注册」和「登记撤销」必须成对，漏一个就是卸载后段错误。
+    ///
+    /// ★ 怎么知道调用者是哪个 fiber：交给插件的 HostApi 是**每个插件各一份**
+    ///   的，ctx 指向一个 per-plugin 薄包装 —— 插件无法冒充别人，也天然做到
+    ///   「谁注册的东西记在谁头上」。
     pub fn apiRegisterService(
         host_ctx: *anyopaque,
         name: [*:0]const u8,
@@ -132,7 +140,9 @@ pub const Context = struct {
         @panic("TODO: 查服务表（不存在返回 null，不是错误）");
     }
 
-    /// HostApi.on_event 的实现。同样要与撤销成对。
+    /// HostApi.on_event 的实现。
+    /// 与 register_service 同构：分配编号 → 入表 → 用宿主分配器登记撤销项。
+    /// 同一事件名可以注册多条，所以撤销必须按编号而不是按事件名。
     pub fn apiOnEvent(
         host_ctx: *anyopaque,
         event: [*:0]const u8,
@@ -146,8 +156,14 @@ pub const Context = struct {
         @panic("TODO: 注册监听 + 登记撤销");
     }
 
-    /// HostApi.revoke 的实现。
-    /// ★ 整套体系里最重要的一个函数：撤销必须在 dlclose 之前完成。
+    /// HostApi.revoke 的实现 —— 插件主动提前撤销某一条注册（可选能力）。
+    ///
+    /// 做三件事：按 Handle.id 在**调用者 fiber 的撤销清单**里找到那一条 →
+    /// 执行它（去宿主表里删掉对应行）→ 把它从清单里移除。
+    /// 找不到 = 早就撤过了，返回 err_not_found，**不崩**（幂等）。
+    ///
+    /// ★ 注意这不是「卸载」：卸载是宿主对整份清单的批量执行；
+    ///   这个函数只是把清单上的单条提前执行。两者共用同一份撤销项。
     pub fn apiRevoke(host_ctx: *anyopaque, h: abi.Handle) callconv(.c) abi.Status {
         _ = host_ctx;
         _ = h;

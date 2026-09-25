@@ -83,11 +83,17 @@ pub fn main(init: std.process.Init) !void {
 /// 编译插件 .so 的命令行（阶段 4 会 fork/exec 它）。
 ///
 /// 实测要点：
-///   · `-dynamic -fPIC` 生成 .so
-///   · **必须 -lc**：不链 libc 时 Linux 走 Zig 自带的 ElfDynLib，动态加载会段错误
-///   · 输出文件名带版本号，避免依赖 dlclose 真的卸载
+///   · `-dynamic` 生成 .so；**必须 -lc**：不链 libc 时 Linux 走 Zig 自带的
+///     ElfDynLib，动态加载会段错误
+///   · **必须显式写模块映射**（--dep / -Mroot / -Mdsh_abi）：`dsh_abi` 是构建图
+///     里的名字，命令行不带映射会直接报
+///     「no module named 'dsh_abi' available within module」
+///     （原草稿那条 `--name {name} {source}` 就是这么失败的，已核实）
+///   · {output} 带版本/指纹，且**不覆盖**已加载的旧文件
+///   · 相对路径按当前工作目录解析，调用时要把 cwd 设成仓库根
 pub const PLUGIN_BUILD_CMDLINE =
-    "zig build-lib -dynamic -fPIC -lc --name {name} {source}";
+    "zig build-lib -dynamic -lc --dep dsh_abi -Mroot={source} " ++
+    "-Mdsh_abi=src/abi.zig --name {name} -femit-bin={output}";
 
 comptime {
     // 编译期断言：契约表里的字段数量/顺序一旦被误改，这里立刻报错。
