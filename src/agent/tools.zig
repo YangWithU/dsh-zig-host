@@ -146,6 +146,29 @@ pub fn find(name: []const u8) ?Tool {
     return null;
 }
 
+/// 生成请求体里 `tools` 字段所需的 JSON 数组文本（OpenAI 格式）。
+///
+/// name/description 用序列化（它们可能含引号），parameters_json 直接嵌入 ——
+/// 它本身就是我们写死的合法 JSON Schema。
+pub fn jsonSpec(arena: std.mem.Allocator) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+
+    try w.writeAll("[");
+    for (all, 0..) |t, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
+        try std.json.Stringify.value(std.mem.span(t.spec.name), .{}, w);
+        try w.writeAll(",\"description\":");
+        try std.json.Stringify.value(std.mem.span(t.spec.description), .{}, w);
+        try w.writeAll(",\"parameters\":");
+        try w.writeAll(std.mem.span(t.spec.parameters_json));
+        try w.writeAll("}}");
+    }
+    try w.writeAll("]");
+    return aw.written();
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 //  C ABI 包装层：把内部 error union 收成 abi.Status（边界上只允许 Status）
 // ───────────────────────────────────────────────────────────────────────────
@@ -205,6 +228,45 @@ fn toolBash(impl: *anyopaque, args_json: [*:0]const u8, out: *Buffer) callconv(.
 fn oomOrInternal(out: *Buffer, e: anyerror) abi.Status {
     _ = failFmt(out, "工具内部错误：{s}", .{@errorName(e)});
     return if (e == error.OutOfMemory) .err_oom else .err_internal;
+}
+
+test "jsonSpec: 生成的工具数组是合法 JSON，且条目数与工具表一致" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const spec = try jsonSpec(a);
+    const v = try std.json.parseFromSlice(std.json.Value, a, spec, .{});
+    try std.testing.expectEqual(@as(usize, all.len), v.value.array.items.len);
+
+    for (v.value.array.items, 0..) |item, i| {
+        const f = item.object.get("function").?.object;
+        try std.testing.expectEqualStrings(std.mem.span(all[i].spec.name), f.get("name").?.string);
+        // parameters 必须是对象（Schema），不是字符串
+        try std.testing.expect(f.get("parameters").? == .object);
+    }
+}
+
+test "四个工具在参数不合法时都不 panic，而是把原因写进 out" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var host = Host{
+        .gpa = std.testing.allocator,
+        .scratch = arena_state.allocator(),
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+    };
+
+    var buf: [256]u8 = undefined;
+    var out = Buffer{ .ptr = &buf, .cap = buf.len };
+
+    inline for (all) |t| {
+        out.len = 0;
+        const st = t.exec(&host, "not json", &out);
+        try std.testing.expect(st != .ok);
+        try std.testing.expect(out.slice().len > 0);
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

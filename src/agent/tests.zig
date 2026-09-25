@@ -7,4 +7,5 @@ test {
     _ = @import("tools.zig");
     _ = @import("context_files.zig");
     _ = @import("llm.zig");
+    _ = @import("loop.zig");
 }

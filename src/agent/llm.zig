@@ -161,14 +161,26 @@ pub const HttpTransport = struct {
     }
 };
 
-/// 回放：不联网，把预先准备好的一段响应原样返回。
+/// 回放：不联网，按顺序返回预先准备好的响应。
 ///
 /// 存在的意义是把 loop 的测试变成确定性的 —— 毫秒级、可断言、不花钱、不受限流影响。
-/// 它顺带记下最后一次请求体，便于断言「我们到底发了什么」。
+/// 支持多个响应是为了测「先调工具、再给结论」这种多轮剧本；
+/// 顺带记下最后一次请求体与调用次数，便于断言「我们发了什么、发了几次」。
 pub const ReplayTransport = struct {
+    responses: []const []const u8 = &.{},
     status: u16 = 200,
-    body: []const u8,
+    calls: usize = 0,
+    /// 给了分配器就把每次请求体拷一份下来 —— 请求体本身是每轮临时 arena 的，
+    /// 循环结束后就没了，直接存指针会悬空（这是被测试逮到过的真实翻车）。
+    gpa: ?std.mem.Allocator = null,
     last_request: []const u8 = "",
+
+    pub fn deinit(self: *ReplayTransport) void {
+        if (self.gpa) |g| {
+            if (self.last_request.len > 0) g.free(self.last_request);
+        }
+        self.last_request = "";
+    }
 
     pub fn asTransport(self: *ReplayTransport) Transport {
         return .{ .ctx = self, .send = send };
@@ -185,8 +197,19 @@ pub const ReplayTransport = struct {
         _ = url;
         _ = auth;
         const self: *ReplayTransport = @ptrCast(@alignCast(ctx));
-        self.last_request = body;
-        return .{ .status = self.status, .body = self.body };
+
+        if (self.gpa) |g| {
+            if (self.last_request.len > 0) g.free(self.last_request);
+            self.last_request = try g.dupe(u8, body);
+        } else {
+            self.last_request = body;
+        }
+
+        defer self.calls += 1;
+        if (self.responses.len == 0) return .{ .status = self.status, .body = "" };
+        // 用完之后一直重复最后一条，免得调用次数一多就报错
+        const i = @min(self.calls, self.responses.len - 1);
+        return .{ .status = self.status, .body = self.responses[i] };
     }
 };
 
@@ -414,7 +437,7 @@ test "complete: 走回放传输，端到端不联网" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    var replay = ReplayTransport{ .body = fake_tool_call_response };
+    var replay = ReplayTransport{ .responses = &.{fake_tool_call_response} };
     var client = Client.init(a, .{}, "fake-key", replay.asTransport());
 
     var session = Session.init(a);
@@ -430,7 +453,7 @@ test "complete: 非 200 时报错而不是硬吞" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    var replay = ReplayTransport{ .status = 429, .body = "{\"error\":\"rate limited\"}" };
+    var replay = ReplayTransport{ .responses = &.{"{\"error\":\"rate limited\"}"}, .status = 429 };
     var client = Client.init(a, .{}, "fake-key", replay.asTransport());
 
     var session = Session.init(a);

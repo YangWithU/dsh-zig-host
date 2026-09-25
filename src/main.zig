@@ -29,6 +29,8 @@ const Context = @import("host/context.zig").Context;
 const hotreload = @import("host/hotreload.zig");
 const tools = @import("agent/tools.zig");
 const context_files = @import("agent/context_files.zig");
+const llm = @import("agent/llm.zig");
+const loop_mod = @import("agent/loop.zig");
 
 pub fn main(init: std.process.Init) !void {
     // 进程级 arena：活到进程结束的东西放这里
@@ -49,16 +51,84 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // TODO(下一步): REPL / 单轮对话 —— 走 agent/loop.zig
+    // ── dsh_zig "问题" → 跑一轮；dsh_zig → 进 REPL ────────────────────────
+    //   以 - 开头的参数留给选项，否则当成一句提问。
+    if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
+        try runAgent(gpa, io, init.environ_map, args[1]);
+        return;
+    }
+    try runAgent(gpa, io, init.environ_map, null);
+}
+
+/// 建好「客户端 + 工具 + 循环」，然后要么跑一轮提问，要么进交互式 REPL。
+///
+/// 两件事共用同一套装配，因为它们的区别只在于「输入从哪儿来」：
+/// 命令行参数给一次，或者从 stdin 反复读。
+fn runAgent(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    once: ?[]const u8,
+) !void {
+    const key = env.get("DEEPSEEK_API_KEY") orelse {
+        std.debug.print(
+            "缺少环境变量 DEEPSEEK_API_KEY。\n" ++
+                "本机已经在 shell 配置里设好；若在新终端里失效，先确认它已导出。\n",
+            .{},
+        );
+        return error.NoApiKey;
+    };
+
+    // 会话级 arena：历史里的字符串活到 REPL 结束
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var http = llm.HttpTransport.init(gpa, io);
+    defer http.deinit();
+    var client = llm.Client.init(gpa, .{}, key, http.asTransport());
+
+    var session = llm.Session.init(gpa);
+    defer session.deinit();
+
+    // 工具内部用的临时分配器，每次调用前不重置也没关系（arena 会一直涨到会话结束）
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    var host = tools.Host{
+        .gpa = gpa,
+        .scratch = scratch_state.allocator(),
+        .io = io,
+        .dir = std.Io.Dir.cwd(),
+    };
+
+    var lp = try loop_mod.Loop.init(gpa, arena, io, std.Io.Dir.cwd(), &client, &session, &host, .{});
+    defer lp.deinit();
+
+    if (once) |text| {
+        lp.runTurn(text) catch |e| std.debug.print("[错误] {s}\n", .{@errorName(e)});
+        return;
+    }
+
     std.debug.print(
-        \\MVP 施工中，已可用的入口：
-        \\  dsh_zig --context                              看会被注入的规范（AGENTS.md）
-        \\  dsh_zig --tool read  '{{"path":"build.zig","limit":5}}'
-        \\  dsh_zig --tool bash  '{{"command":"ls src"}}'
-        \\  dsh_zig --tool write '{{"path":"/tmp/x.txt","content":"hi"}}'
-        \\  dsh_zig --tool edit  '{{"path":"/tmp/x.txt","oldText":"hi","newText":"bye"}}'
+        \\dsh_zig REPL。可用工具：read / write / edit / bash。
+        \\直接描述你想做的事；输入 exit 或 Ctrl-D 退出。
         \\
     , .{});
+
+    var stdin_buf: [8192]u8 = undefined;
+    var file_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buf);
+    while (true) {
+        std.debug.print("\n> ", .{});
+        // null = 输入结束（Ctrl-D / 管道读完）
+        const line = (try file_reader.interface.takeDelimiter('\n')) orelse break;
+        const text = std.mem.trim(u8, line, " \t\r");
+        if (text.len == 0) continue;
+        if (std.mem.eql(u8, text, "exit") or std.mem.eql(u8, text, "quit")) break;
+
+        // text 指向 reader 的内部缓冲区（下次读就失效），runTurn 会先拷走
+        lp.runTurn(text) catch |e| std.debug.print("[错误] {s}\n", .{@errorName(e)});
+    }
+    std.debug.print("\n再见。\n", .{});
 }
 
 /// 打印启动时会作为第一条 system 消息注入的规范文本。
