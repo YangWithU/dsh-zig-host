@@ -113,4 +113,20 @@ pub fn build(b: *std.Build) void {
     });
     agent_test_mod.link_libc = true;
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = agent_test_mod })).step);
+
+    // host 目录的测试（插件内核）。各文件的 test 由 tests.zig 聚合。
+    //
+    // 阶段 1 的验收命题在这里兑现：
+    //     「挂载插件 -> 注册 N 项 -> 卸载 -> 确认 N 项全部撤销且无残留」
+    // 这条测试通过之前，后面的阶段都建立在不安全的地基上。
+    const host_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/host/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "dsh_abi", .module = abi_mod },
+        },
+    });
+    host_test_mod.link_libc = true;
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host_test_mod })).step);
 }
