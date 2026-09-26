@@ -5,4 +5,6 @@
 
 test {
     _ = @import("services.zig");
+    _ = @import("loader.zig");
+    _ = @import("fiber.zig");
 }
