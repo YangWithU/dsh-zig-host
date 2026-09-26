@@ -16,3 +16,4 @@
 | `plugin-memory/` | 反复重载会不会越吃越多 | 真正 dlclose 时零增长（20 次加载卸载 13.5 MB -> 13.7 MB）；不卸载则每份约 2.4 MB 虚拟 / 275 KB 物理 |
 | `build-cache/` | 「源码变了没」该用什么判据 | mtime 是假信号（touch 不触发重编）；zig 自己的缓存按内容判定，无改动时 37 ms 命中 |
 | `zig-016-api/` | Zig 0.16 的 HTTPS、文件、子进程、JSON 能否直接用 | 全部可用，但 API 与 0.11–0.15 的教程完全不同，详见各文件头 |
+| `arena-alloc/` | ArenaAllocator 的 alloc 四级回退各自何时触发；对齐填充与 free 的真实语义 | 单线程下 free_list 恒空（第 3 级是多线程抢挂失败后的回收站）；bump 失败会把 end_index 永久顶高、可超过 buf_len；free 只对 head chunk 的最后一次分配生效 |

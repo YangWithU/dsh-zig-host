@@ -29,6 +29,9 @@ zig build run    # 运行宿主
 - `std.fs.cwd()` 已移除，改用 `std.Io.Dir.cwd()`，且要传 `io`
 - 起子进程用 `std.process.run(gpa, io, .{ ... })`
 - HTTP 用 `std.http.Client{ .allocator, .io }` 加 `client.fetch(.{ ... })`，系统根证书自动加载
+- `std.heap.ArenaAllocator.alloc` 是四级回退：bump 指针 → 原地扩容 → 复用 free_list → 找子分配器要新 chunk。
+  单线程下 free_list 恒为空；bump 失败会把 `end_index` 永久顶高（可超过 buf_len），该 chunk 尾部就此作废。
+  实测见 `experiments/arena-alloc/`（带断言，可复跑）
 
 ## 三条基调决策
 
