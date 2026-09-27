@@ -33,7 +33,12 @@
 const std = @import("std");
 
 /// ABI 版本。宿主与插件必须一致，否则加载被拒绝（第一道防线）。
-pub const ABI_VERSION: u32 = 1;
+///
+/// 1 -> 2：HostApi 增加 read_file / write_file / run_shell 三个基础能力
+///（把工具搬进 .so 需要它们），Status 增加 err_too_large / err_timeout。
+/// 旧插件会被 loader 拒绝加载 —— 这正是版本号存在的意义：
+/// 跨边界类型的布局一旦改变，调用不会报错，只会崩。
+pub const ABI_VERSION: u32 = 2;
 
 /// 跨边界统一返回码。**绝不跨边界抛 Zig error。**
 pub const Status = enum(c_int) {
@@ -45,6 +50,11 @@ pub const Status = enum(c_int) {
     err_oom = 5,
     err_not_found = 6,
     err_internal = 7,
+    /// 结果超过宿主设定的上限（文件太大 / 命令输出太多）。
+    /// 与 err_invalid_arg 分开：这不是调用方用法错，是数据本身放不下。
+    err_too_large = 8,
+    /// 超时（目前只有 run_shell 会返回它）。
+    err_timeout = 9,
 };
 
 /// 注册句柄。**id 由宿主分配，注册时返回给注册方。**
@@ -158,6 +168,89 @@ pub const OnEventFn = *const fn (
 /// 语义：幂等。同一个 handle 撤两次，第二次返回 err_not_found，不崩。
 pub const RevokeFn = *const fn (host_ctx: *anyopaque, handle: Handle) callconv(.c) Status;
 
+// ───────────────────────────────────────────────────────────────────────────
+//  基础能力：文件与进程
+//
+//  为什么是宿主给的能力、而不是插件自己调 std.fs / std.process：
+//  插件是被加载进来的陌生代码，它**没有资格**自己碰文件系统与进程。
+//  能力由宿主授予（将来才能做审计、限流、沙箱），所以它和 alloc/log 同级，
+//  而不是「某个插件提供的服务」—— 后者会让基础能力依赖另一个插件的存活。
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 跨边界的一段内存。
+///
+/// ★ **由宿主分配，从「调用者所属 fiber 的 arena」切**，随该 fiber 卸载一起
+///   回收。插件拿到后不需要也无法释放它 —— 调用者自己就是它的主人。
+pub const Bytes = extern struct {
+    ptr: ?[*]u8 = null,
+    len: usize = 0,
+
+    pub fn slice(self: *const Bytes) []const u8 {
+        const p = self.ptr orelse return &.{};
+        return p[0..self.len];
+    }
+};
+
+/// 命令的终止方式。
+/// 为什么不用 `?i32` 表示「没有退出码」：extern struct 不允许非指针 optional
+///（没有保证的内存布局）。用显式的枚举 + 一个 code 字段代替。
+pub const TermKind = enum(c_int) {
+    /// 正常退出，此时 code 是退出码（0-255）
+    exited = 0,
+    /// 被信号终止，此时 code 是信号编号
+    signal = 1,
+    /// 其它（stopped / 未知）
+    other = 2,
+};
+
+/// 一条命令的执行结果。stdout / stderr 的内存同样来自调用者的 arena。
+pub const ShellResult = extern struct {
+    term: TermKind = .other,
+    /// term 为 exited 时是退出码；为 signal 时是信号编号；other 时无意义
+    code: i32 = 0,
+
+    stdout_ptr: ?[*]u8 = null,
+    stdout_len: usize = 0,
+    stderr_ptr: ?[*]u8 = null,
+    stderr_len: usize = 0,
+
+    pub fn stdout(self: *const ShellResult) []const u8 {
+        const p = self.stdout_ptr orelse return &.{};
+        return p[0..self.stdout_len];
+    }
+
+    pub fn stderr(self: *const ShellResult) []const u8 {
+        const p = self.stderr_ptr orelse return &.{};
+        return p[0..self.stderr_len];
+    }
+};
+
+/// 读一个文件，内容写进 out（内存由宿主从调用者 arena 分配）。
+pub const ReadFileFn = *const fn (
+    host_ctx: *anyopaque,
+    path: [*:0]const u8,
+    out: *Bytes,
+) callconv(.c) Status;
+
+/// 写一个文件（覆盖）。data 只在调用期间需要有效。
+pub const WriteFileFn = *const fn (
+    host_ctx: *anyopaque,
+    path: [*:0]const u8,
+    data: [*]const u8,
+    len: usize,
+) callconv(.c) Status;
+
+/// 用 `bash -lc` 跑一条命令。
+///
+/// ★ **命令非 0 退出不算失败**：返回 ok，调用方自己看 exit_code。
+///   模型需要看到错误输出来自己纠正，把非 0 当失败会把它挡在真相外面。
+pub const RunShellFn = *const fn (
+    host_ctx: *anyopaque,
+    command: [*:0]const u8,
+    timeout_s: u32,
+    out: *ShellResult,
+) callconv(.c) Status;
+
 /// 宿主给插件的全部能力。插件**只能**通过这个结构触达宿主。
 pub const HostApi = extern struct {
     abi_version: u32,
@@ -166,6 +259,11 @@ pub const HostApi = extern struct {
 
     alloc: AllocFn,
     log: LogFn,
+
+    // 基础能力（文件 / 进程）—— 宿主授予，插件不得自己碰 std.fs / std.process
+    read_file: ReadFileFn,
+    write_file: WriteFileFn,
+    run_shell: RunShellFn,
 
     register_service: RegisterServiceFn,
     get_service: GetServiceFn,

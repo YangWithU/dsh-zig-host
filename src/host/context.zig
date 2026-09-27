@@ -40,7 +40,8 @@
 //!   已完成: init / deinit / newFiber / apiAlloc / apiLog
 //!          apiRegisterService / apiGetService / apiRevoke（服务注册闭环）
 //!          mountPlugin / unmountPlugin（真 dlopen 一个 .so）
-//!   下一步: 工具插件搬家（agent/tools.zig 的四件套搬进 .so）
+//!          apiReadFile / apiWriteFile / apiRunShell（ABI v2 的三个基础能力）
+//!   下一步: plugins/tools.zig 把四件套搬进 .so
 //!   推迟:   apiOnEvent（事件总线第二批）、依赖门（settle）、隔离作用域
 //!
 //! 已知待决问题（等第一个真实的消费者插件出现再定，现在不拍脑袋设计）
@@ -320,7 +321,6 @@ pub const Context = struct {
     }
 
     /// HostApi.revoke：插件主动提前撤销某一条注册（可选能力）。
-    ///
     /// 在本 fiber 的撤销清单里按 (id, generation) 找到那一条 -> 执行它
     /// （去宿主表里删行）-> 从清单里移除。
     ///
@@ -340,6 +340,92 @@ pub const Context = struct {
 
         // 找不到 = 早就撤过了（幂等，不崩）
         return .err_not_found;
+    }
+
+    // ── 基础能力：文件与进程（ABI v2） ────────────────────────────────────
+
+    /// HostApi.read_file：读文件，内存从**调用者自己的 arena** 切。
+    ///
+    /// 为什么由宿主分配而不是让插件先给缓冲区：文件大小不可预知；而调用者
+    /// arena 随它的 fiber 卸载整体回收，宿主不需要为这块内存做任何记账。
+    pub fn apiReadFile(
+        host_ctx: *anyopaque,
+        path: [*:0]const u8,
+        out: *abi.Bytes,
+    ) callconv(.c) abi.Status {
+        const slot = slotFrom(host_ctx);
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            slot.host.io,
+            std.mem.span(path),
+            slot.fiber.allocator(),
+            .limited(max_read_bytes),
+        ) catch |e| return fileErrorStatus(e);
+
+        out.ptr = data.ptr;
+        out.len = data.len;
+        return .ok;
+    }
+
+    /// HostApi.write_file：覆盖写入。
+    /// data 由调用者提供，只在这次调用期间需要有效 —— 宿主立刻写出去，不留引用。
+    pub fn apiWriteFile(
+        host_ctx: *anyopaque,
+        path: [*:0]const u8,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(.c) abi.Status {
+        const slot = slotFrom(host_ctx);
+        std.Io.Dir.cwd().writeFile(slot.host.io, .{
+            .sub_path = std.mem.span(path),
+            .data = data[0..len],
+        }) catch |e| return fileErrorStatus(e);
+        return .ok;
+    }
+
+    /// HostApi.run_shell：`bash -lc <command>`，结果写进 out。
+    ///
+    /// 命令非 0 退出返回 ok（exit_code 里有值）—— 只有「跑不起来」才是错误。
+    pub fn apiRunShell(
+        host_ctx: *anyopaque,
+        command: [*:0]const u8,
+        timeout_s: u32,
+        out: *abi.ShellResult,
+    ) callconv(.c) abi.Status {
+        const slot = slotFrom(host_ctx);
+
+        const res = std.process.run(slot.fiber.allocator(), slot.host.io, .{
+            // 用 bash -lc 而不是自己切词：命令原样交给 shell，与用户手敲一致
+            .argv = &.{ "bash", "-lc", std.mem.span(command) },
+            .stdout_limit = .limited(max_shell_bytes),
+            .stderr_limit = .limited(max_shell_bytes),
+            .timeout = .{ .duration = .{
+                .raw = std.Io.Duration.fromSeconds(timeout_s),
+                .clock = .awake,
+            } },
+        }) catch |e| return shellErrorStatus(e);
+
+        out.* = .{
+            .stdout_ptr = res.stdout.ptr,
+            .stdout_len = res.stdout.len,
+            .stderr_ptr = res.stderr.ptr,
+            .stderr_len = res.stderr.len,
+        };
+        switch (res.term) {
+            .exited => |code| {
+                out.term = .exited;
+                out.code = @intCast(code);
+            },
+            .signal => |sig| {
+                out.term = .signal;
+                out.code = @intCast(@intFromEnum(sig));
+            },
+            .stopped => |sig| {
+                out.term = .signal;
+                out.code = @intCast(@intFromEnum(sig));
+            },
+            .unknown => {},
+        }
+        return .ok;
     }
 };
 
@@ -369,10 +455,40 @@ fn buildApi(slot: *PluginSlot) abi.HostApi {
         .ctx = @ptrCast(slot),
         .alloc = Context.apiAlloc,
         .log = Context.apiLog,
+        .read_file = Context.apiReadFile,
+        .write_file = Context.apiWriteFile,
+        .run_shell = Context.apiRunShell,
         .register_service = Context.apiRegisterService,
         .get_service = Context.apiGetService,
         .on_event = Context.apiOnEvent,
         .revoke = Context.apiRevoke,
+    };
+}
+
+/// 单次读文件的硬上限（防一条 read 把整个大文件灌进 arena）。
+/// 这是防爆内存的底线，不是给模型的约束 —— 模型要读多少行由工具的 offset/limit 管。
+const max_read_bytes: usize = 16 * 1024 * 1024;
+
+/// 单次命令 stdout / stderr 各自的硬上限（同上是防爆，不是约束）。
+const max_shell_bytes: usize = 4 * 1024 * 1024;
+
+/// 文件类操作的错误 → 跨边界状态码。
+fn fileErrorStatus(e: anyerror) abi.Status {
+    return switch (e) {
+        error.FileNotFound => .err_not_found,
+        error.OutOfMemory => .err_oom,
+        error.StreamTooLong => .err_too_large,
+        else => .err_internal,
+    };
+}
+
+/// 起进程类操作的错误 → 跨边界状态码。
+fn shellErrorStatus(e: anyerror) abi.Status {
+    return switch (e) {
+        error.Timeout => .err_timeout,
+        error.StreamTooLong => .err_too_large,
+        error.OutOfMemory => .err_oom,
+        else => .err_internal,
     };
 }
 
@@ -605,4 +721,67 @@ test "deinit: 卸掉所有 fiber 且无泄漏（testing.allocator 会报告）" 
     try std.testing.expectEqual(@as(usize, 3), ctx.fibers.items.len);
 
     ctx.deinit();
+}
+
+test "apiWriteFile / apiReadFile：写得进读得到，内存记在调用者账上" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const slot = try ctx.newFiber("io-test", null);
+    const api = slot.api;
+
+    const path = "/tmp/dsh-context-io-test.txt";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const content = "hello\nworld\n";
+    try std.testing.expectEqual(
+        abi.Status.ok,
+        api.write_file(api.ctx, path, content.ptr, content.len),
+    );
+
+    var got: abi.Bytes = .{};
+    try std.testing.expectEqual(abi.Status.ok, api.read_file(api.ctx, path, &got));
+    try std.testing.expectEqualStrings(content, got.slice());
+    // 读回来的内存是从**调用者自己**的 arena 切的
+    try std.testing.expect(slot.fiber.arena.queryCapacity() > 0);
+
+    // 文件不存在要说清楚是「找不到」，而不是笼统的内部错误
+    var missing: abi.Bytes = .{};
+    try std.testing.expectEqual(
+        abi.Status.err_not_found,
+        api.read_file(api.ctx, "/tmp/dsh-no-such-file-xyz", &missing),
+    );
+}
+
+test "apiRunShell：拿到退出码与两路输出；非 0 退出不算失败" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const slot = try ctx.newFiber("shell-test", null);
+    const api = slot.api;
+
+    var res: abi.ShellResult = .{};
+    const st = api.run_shell(api.ctx, "echo to-stdout; echo to-stderr 1>&2; exit 3", 30, &res);
+
+    // 命令退出了（哪怕非 0）就是 ok —— 模型需要看到错误输出才能自己纠正
+    try std.testing.expectEqual(abi.Status.ok, st);
+    try std.testing.expectEqual(abi.TermKind.exited, res.term);
+    try std.testing.expectEqual(@as(i32, 3), res.code);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout(), "to-stdout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stderr(), "to-stderr") != null);
+}
+
+test "apiRunShell：超时返回 err_timeout（花 1 秒）" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const slot = try ctx.newFiber("timeout-test", null);
+    var res: abi.ShellResult = .{};
+    try std.testing.expectEqual(
+        abi.Status.err_timeout,
+        slot.api.run_shell(slot.api.ctx, "sleep 5", 1, &res),
+    );
 }
