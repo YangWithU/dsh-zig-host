@@ -117,6 +117,18 @@ fn runAgent(
         },
     ));
 
+    // 第二个插件：hello。它在真实对话里没有业务作用，但它是**观察者** ——
+    // 监听 tool/pre-execute 打一行日志，让「事件总线真的在工作」肉眼可见。
+    // 挂两个插件同时验证了多插件共存（服务表与撤销清单互不干扰）。
+    // 挂了也不致命：它只是个观察点。
+    switch (ctx.mountPlugin("zig-out/lib/libhello.so", "{}")) {
+        .ok => {},
+        .failed => |st| std.debug.print(
+            "[warn] hello 观察者插件没挂上（{s}），事件观察点缺席\n",
+            .{@tagName(st)},
+        ),
+    }
+
     // ── 热重载 ───────────────────────────────────────────────────────────
     // 每次读输入前看一眼插件源码的**内容指纹**：变了就重编到新路径、拆旧装新。
     // 所以「改一行源码 -> 回到终端按回车 -> 下一次工具调用就是新代码」。
@@ -156,6 +168,11 @@ fn runAgent(
     }
     defer if (log) |*l| l.close();
 
+    // 事件派发器：把 Context 的 emit 交给 loop。loop 只认这个函数指针，
+    // 不认识宿主内部类型（agent 层与 host 层不互相 import）。
+    // ctx 用当前 slot —— apiEmit 靠它反查 bus；热重载换了 slot 之后要换上新的。
+    const dispatch_ctx: *anyopaque = tools_slot.api.ctx;
+
     var lp = try loop_mod.Loop.init(
         gpa,
         arena,
@@ -165,6 +182,7 @@ fn runAgent(
         &session,
         tools_iface,
         if (log) |*l| l else null,
+        .{ .ctx = dispatch_ctx, .call = Context.apiEmit },
         .{},
     );
     defer lp.deinit();
@@ -214,6 +232,7 @@ fn runAgent(
                     ctx.registry.get(tool_api.SERVICE_NAME, 0) orelse unreachable,
                 ));
                 // 先建新的、成功了再拆旧的：Loop.init 失败时旧的那个依然有效
+                const fresh_slot = ctx.slotOfFiber(spec.current.?) orelse unreachable;
                 const fresh = try loop_mod.Loop.init(
                     gpa,
                     arena,
@@ -223,6 +242,8 @@ fn runAgent(
                     &session,
                     fresh_iface,
                     if (log) |*l| l else null,
+                    // 派发器的 ctx 必须换成新 slot —— 旧的随上一个 fiber 销毁了
+                    .{ .ctx = fresh_slot.api.ctx, .call = Context.apiEmit },
                     .{},
                 );
                 lp.deinit();
@@ -312,5 +333,5 @@ comptime {
     // （ABI 是双方共享的冻结面，改动必须是有意识的 —— 每次有意变更后把下面
     //   的数字一起改掉，这本身就证明了「我是知情的」。）
     std.debug.assert(@sizeOf(abi.Handle) == 16);
-    std.debug.assert(abi.ABI_VERSION == 3);
+    std.debug.assert(abi.ABI_VERSION == 4);
 }

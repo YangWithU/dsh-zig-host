@@ -56,8 +56,8 @@ test "真加载：dlopen -> init 注册服务 -> 卸载零残留" {
     try std.testing.expect(entry.owner == slot.fiber);
 
     // 记账成对：宿主在注册那一刻就记了一条撤销项
-    // （一等服务 + 两个事件监听 = 三条账）
-    try std.testing.expectEqual(@as(usize, 3), slot.fiber.disposers.items.len);
+    // （一等服务 + 三个事件监听 = 四条账）
+    try std.testing.expectEqual(@as(usize, 4), slot.fiber.disposers.items.len);
 
     // ★ 真的调用插件里的代码 —— 魔数对得上，证明拿到的是那个 .so 里的函数
     const iface: *const greeter.GreeterIface = @ptrCast(@alignCast(entry.iface));
@@ -133,7 +133,7 @@ test "同一个 .so 挂两份：第二份因同名服务被拒 -> 加载失败 -
     try std.testing.expectEqual(@as(usize, 1), ctx.registry.count());
     try std.testing.expectEqual(fiber_mod.State.active, a.fiber.state);
     // 第一份的账也没被动（失败的那份没有往清单里塞任何东西）
-    try std.testing.expectEqual(@as(usize, 3), a.fiber.disposers.items.len);
+    try std.testing.expectEqual(@as(usize, 4), a.fiber.disposers.items.len);
 
     ctx.unmountPlugin(a);
     try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
@@ -251,12 +251,13 @@ test "事件总线跨 ABI：回调真的进了插件代码；waterfall 能改写
 
     const slot = try mountOrFail(&ctx, hello_path);
 
-    // 插件 init 里注册的两个监听进了总线
-    try std.testing.expectEqual(@as(usize, 2), ctx.bus.count());
+    // 插件 init 里注册的三个监听进了总线
+    try std.testing.expectEqual(@as(usize, 3), ctx.bus.count());
     try std.testing.expectEqual(@as(usize, 1), ctx.bus.countFor(ping_event));
     try std.testing.expectEqual(@as(usize, 1), ctx.bus.countFor(prompt_event));
-    // 一份服务 + 两个监听 = 三条账
-    try std.testing.expectEqual(@as(usize, 3), slot.fiber.disposers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.bus.countFor(abi.EventNames.tool_pre_execute));
+    // 一份服务 + 三个监听 = 四条账
+    try std.testing.expectEqual(@as(usize, 4), slot.fiber.disposers.items.len);
 
     // ① emit：回调研到的是 libhello.so 里的函数（会往日志打一行）
     var ping_payload = abi.EventPayload{ .name = ping_event, .json = "{}" };

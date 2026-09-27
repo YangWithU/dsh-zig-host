@@ -182,8 +182,10 @@ const Walk = struct {
             // 不调 next() 就直接把当前返回值交出去（＝否决）。
             return l.cb(l.user, self.payload, @ptrCast(self), nextFn);
         }
-        // 链尾 = 默认行为。发布方已经把默认内容写进 payload.out 了，
-        // 这里没有额外要做的事 —— 事件没有「内置实现」这个概念。
+        // 链尾 = 默认行为。这是洋葱的最内层：监听器都放行了才会走到这里，
+        // 任何一个没调 next()（否决）它就不会被执行 —— 「权限门拦得住动作」
+        // 靠的就是这一点。没有默认行为时（纯通知类事件）直接算成功。
+        if (self.payload.default_action) |act| return act(self.payload);
         return .ok;
     }
 };
@@ -401,6 +403,47 @@ test "事件名被拷贝持有：插件那边的原字符串失效后总线仍�
     var payload = abi.EventPayload{ .name = "x", .json = "{}" };
     try std.testing.expectEqual(abi.Status.ok, bus.dispatch("x", &payload, .emit));
     try std.testing.expectEqualStrings("A", t.text());
+}
+
+test "waterfall: 链尾的默认行为 —— 放行才执行，否决就不执行" {
+    const gpa = std.testing.allocator;
+    var bus = Bus.init(gpa);
+    defer bus.deinit();
+
+    const owner = ownerStub(7);
+    var t = Trace{};
+
+    const Action = struct {
+        var hits: usize = 0;
+        fn run(_: *abi.EventPayload) callconv(.c) abi.Status {
+            hits += 1;
+            return .ok;
+        }
+    };
+
+    var payload = abi.EventPayload{
+        .name = "act",
+        .json = "{}",
+        .default_action = Action.run,
+    };
+
+    // 没有监听器：默认行为直接执行
+    try std.testing.expectEqual(abi.Status.ok, bus.dispatch("act", &payload, .waterfall));
+    try std.testing.expectEqual(@as(usize, 1), Action.hits);
+
+    // 挂一个放行的监听器：仍然会执行
+    _ = bus.on(.{ .event = "act", .cb = traceNext, .user = @ptrCast(&t), .owner = owner });
+    try std.testing.expectEqual(abi.Status.ok, bus.dispatch("act", &payload, .waterfall));
+    try std.testing.expectEqual(@as(usize, 2), Action.hits);
+    try std.testing.expectEqualStrings("A", t.text());
+
+    // 换成一个否决的监听器：默认行为不再执行
+    var t2 = Trace{};
+    bus.deinit();
+    bus = Bus.init(gpa);
+    _ = bus.on(.{ .event = "act", .cb = denyNext, .user = @ptrCast(&t2), .owner = owner });
+    try std.testing.expectEqual(abi.Status.err_denied, bus.dispatch("act", &payload, .waterfall));
+    try std.testing.expectEqual(@as(usize, 2), Action.hits); // 没再涨
 }
 
 test "同一事件挂多个监听：编号互不相同、撤销其中一个不影响另一个" {

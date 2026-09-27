@@ -39,9 +39,11 @@ const std = @import("std");
 /// 2 -> 3：事件总线上线。Callback 的签名必须变 —— 旧签名没有放行把手、没有
 /// 返回值、payload 还是只读的，装不下 waterfall（环绕中间件）。同时 on_event
 /// 去掉了 mode 参数（改由发布方指定），HostApi 增加 emit。
+/// 3 -> 4：EventPayload 增加 default_action / action_ctx —— waterfall 的「链尾
+/// 默认行为」（比如「真的去执行这个工具」）必须有个地方挂。
 /// 旧插件会被 loader 拒绝加载 —— 这正是版本号存在的意义：
 /// 跨边界类型的布局一旦改变，调用不会报错，只会崩。
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// 跨边界统一返回码。**绝不跨边界抛 Zig error。**
 pub const Status = enum(c_int) {
@@ -104,6 +106,15 @@ pub const EventPayload = extern struct {
     out_ptr: ?[*]u8 = null,
     out_cap: usize = 0,
     out_len: usize = 0,
+
+    /// 链尾「默认行为」的上下文（发布方给）。默认行为是个普通 C 函数，没有它
+    /// 就找不回自己的状态 —— 与 Callback 的 user 参数同构。
+    action_ctx: ?*anyopaque = null,
+
+    /// 链尾的「默认行为」。整条链都放行之后才会执行；任何一个监听器不调
+    /// next()（否决），它就永远不会执行 —— 这就是「权限门」为什么能拦住动作。
+    /// null = 没有默认行为（比如纯通知类事件），链尾直接返回 ok。
+    default_action: ?*const fn (payload: *EventPayload) callconv(.c) Status = null,
 
     pub fn out(self: *const EventPayload) []const u8 {
         const p = self.out_ptr orelse return &.{};
@@ -374,3 +385,20 @@ pub const PluginDeinitFn = *const fn () callconv(.c) void;
 pub const SYM_ABI_VERSION = "dsh_plugin_abi_version";
 pub const SYM_INIT = "dsh_plugin_init";
 pub const SYM_DEINIT = "dsh_plugin_deinit";
+
+/// 内置事件名。
+///
+/// 用常量而不是让发布方与监听方各写一遍字符串：事件名拼错是**最难查的一类
+/// bug** —— 不报错、不崩，只是那个监听永远不触发，看起来像“插件没生效”。
+pub const EventNames = struct {
+    /// 工具即将执行（waterfall）。监听器可以否决（不调 next），也可以先调
+    /// next 拿到执行结果再改写。链尾默认行为 = 真的执行这个工具。
+    pub const tool_pre_execute = "tool/pre-execute";
+
+    /// 一次工具调用发生了（emit）。只观察，改不了任何东西 —— 日志、统计、UI。
+    pub const tool_call = "tool/call";
+
+    /// 请求即将发出（waterfall）。监听器往 payload.out 写「额外要注入的上下文」，
+    /// 宿主把它拼进这一轮的 system 消息（不写进会话历史）。
+    pub const agent_request = "agent/request";
+};

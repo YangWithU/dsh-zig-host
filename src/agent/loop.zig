@@ -35,6 +35,21 @@ pub const Config = struct {
     tool_output_bytes: usize = 64 * 1024,
 };
 
+/// 事件派发器，由宿主注入（null = 不派发事件）。
+///
+/// 用函数指针而不是直接 import host/events.zig：agent 层不该认识宿主内部类型
+/// （而且 src/agent 本来就 import 不到 src/host —— 模块边界），测试里也能塞一个
+/// 记录用的假派发器。签名与 abi.EmitFn 同形，所以 main 里直接写
+/// `Context.apiEmit` 就行。
+pub const Dispatcher = struct {
+    ctx: *anyopaque,
+    call: *const fn (
+        ctx: *anyopaque,
+        payload: *abi.EventPayload,
+        mode: abi.DispatchMode,
+    ) callconv(.c) abi.Status,
+};
+
 pub const Loop = struct {
     gpa: std.mem.Allocator,
     /// 会话级 arena：历史里的字符串活到这里
@@ -46,6 +61,8 @@ pub const Loop = struct {
     tools_iface: *const tool_api.ToolsIface,
     /// 会话日志（可为 null：记录不是硬依赖）
     log: ?*session_log.Log = null,
+    /// 事件派发器（可为 null：不派发事件）
+    dispatcher: ?Dispatcher = null,
     tools_json: []const u8,
     system_prompt: []const u8,
     cfg: Config,
@@ -60,6 +77,7 @@ pub const Loop = struct {
         session: *llm.Session,
         tools_iface: *const tool_api.ToolsIface,
         log: ?*session_log.Log,
+        dispatcher: ?Dispatcher,
         cfg: Config,
     ) !Loop {
         // 工具清单与 system 提示只组装一次 —— 它们在一次会话里不会变。
@@ -75,6 +93,7 @@ pub const Loop = struct {
             .session = session,
             .tools_iface = tools_iface,
             .log = log,
+            .dispatcher = dispatcher,
             .tools_json = tools_json,
             .system_prompt = system_prompt,
             .cfg = cfg,
@@ -106,7 +125,25 @@ pub const Loop = struct {
             defer turn.deinit();
             const ta = turn.allocator();
 
-            const done = try self.client.complete(ta, self.session, self.tools_json);
+            // 请求前给插件一个「注入额外上下文」的机会（agent/request 的 waterfall）。
+            // 没有监听器时整条链就是空转，开销等于一次函数调用 —— 不必先问有没人听。
+            var inject_buf: [8 * 1024]u8 = undefined;
+            var injected: []const u8 = &.{};
+            if (self.dispatcher) |d| {
+                const info = try std.fmt.allocPrintSentinel(ta, "{{\"messages\":{d}}}", .{
+                    self.session.messages.items.len,
+                }, 0);
+                var p = abi.EventPayload{
+                    .name = abi.EventNames.agent_request,
+                    .json = info.ptr,
+                    .out_ptr = &inject_buf,
+                    .out_cap = inject_buf.len,
+                };
+                _ = d.call(d.ctx, &p, .waterfall);
+                injected = p.out();
+            }
+
+            const done = try self.client.complete(ta, self.session, self.tools_json, injected);
 
             if (done.text.len > 0) std.debug.print("{s}\n", .{done.text});
 
@@ -146,19 +183,63 @@ pub const Loop = struct {
     /// 执行一个工具调用，返回可长期保存（已拷进 session arena）的结果文本。
     ///
     /// ★ 这里**不出现任何工具名**：名字与参数原样交给工具表，由它去认。
-    ///   「未知工具」也是它给出的回答（写在 out 里的一段文字），loop 只负责搬运。
+    ///   「未知工具」也是它给出的回答（写在 out 里的一段文字”，loop 只负责搬运。
+    ///
+    /// 接了事件总线之后，一次调用会经过三个点：
+    ///   ① tool/call（emit）       广播一声，只观察
+    ///   ② tool/pre-execute（waterfall）包住「执行」：监听器能否决，能否决掉
+    ///      整次调用；链尾默认行为才是真的执行（见 executeToolDefault）
+    ///   ③ 没注入派发器时直接执行（事件总线不参与）
     fn runTool(self: *Loop, ta: std.mem.Allocator, call: llm.ToolCall) ![]const u8 {
         // 跨 ABI 的参数要 C 字符串
         const name_z = try ta.dupeZ(u8, call.name);
         const args_z = try ta.dupeZ(u8, call.arguments_json);
 
         var out = tools.Buffer{ .ptr = self.tool_buf.ptr, .cap = self.tool_buf.len, .len = 0 };
-        const status = self.tools_iface.execute(
-            self.tools_iface.impl,
-            name_z.ptr,
-            args_z.ptr,
-            &out,
-        );
+        var status: abi.Status = .ok;
+
+        if (self.dispatcher) |d| {
+            // ① 广播一声（改不了任何东西，它是通知）
+            const info = try toolCallJson(ta, call);
+            var call_payload = abi.EventPayload{
+                .name = abi.EventNames.tool_call,
+                .json = info.ptr,
+            };
+            _ = d.call(d.ctx, &call_payload, .emit);
+
+            // ② waterfall 包住执行。链尾默认行为 = 真的执行这个工具。
+            var action = ToolAction{
+                .iface = self.tools_iface,
+                .name_z = name_z.ptr,
+                .args_z = args_z.ptr,
+                .out = &out,
+            };
+            const info2 = try toolCallJson(ta, call);
+            var exec_payload = abi.EventPayload{
+                .name = abi.EventNames.tool_pre_execute,
+                .json = info2.ptr,
+                .out_ptr = self.tool_buf.ptr,
+                .out_cap = self.tool_buf.len,
+                .action_ctx = @ptrCast(&action),
+                .default_action = executeToolDefault,
+            };
+            status = d.call(d.ctx, &exec_payload, .waterfall);
+
+            // 否决时监听器可能什么都没写，而模型只能看到 out 里的文字 ——
+            // 空结果会让它以为工具成功了。补一句原因。
+            if (status != .ok and out.len == 0) {
+                var w = out.writer();
+                w.print("工具 {s} 被拒绝（{s}），没有执行", .{ call.name, @tagName(status) }) catch {};
+                out.finish(&w);
+            }
+        } else {
+            status = self.tools_iface.execute(
+                self.tools_iface.impl,
+                name_z.ptr,
+                args_z.ptr,
+                &out,
+            );
+        }
 
         const text = out.slice();
         if (status != .ok) {
@@ -172,7 +253,43 @@ pub const Loop = struct {
         return self.session_arena.dupe(u8, text);
     }
 
-    /// 把这一轮的 tool_calls 拷进 session arena（它们原本指向临时 arena）。
+    /// 把一次工具调用编成事件载荷 JSON。
+///
+/// `arguments` 用**字符串**序列化（而不是把参数文本直接嵌进去）：模型给的参数
+/// 不保证是合法 JSON，直接嵌会把整个载荷弄坏，而载荷一坏，后面所有监听器都遭殃。
+fn toolCallJson(arena: std.mem.Allocator, call: llm.ToolCall) ![:0]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+
+    try w.writeAll("{\"tool\":");
+    try std.json.Stringify.value(call.name, .{}, w);
+    try w.writeAll(",\"arguments\":");
+    try std.json.Stringify.value(call.arguments_json, .{}, w);
+    try w.writeAll("}");
+    try w.writeByte(0);
+
+    const all = aw.written();
+    return all[0 .. all.len - 1 : 0];
+}
+
+/// tool/pre-execute 的链尾默认行为：真的去执行这个工具调用。
+///
+/// ★ **不支持「监听器改参数」**：参数在 action_ctx 里，而不是从 payload.json 重新
+///   解析 —— 因为这是个 C 函数，没有分配器，解析 JSON 再转 C 字符串的代价与复杂
+///   度都不值。监听器能做的是「否决」（不调 next）和「改写结果」（调完 next 再写 out）。
+const ToolAction = struct {
+    iface: *const tool_api.ToolsIface,
+    name_z: [*:0]const u8,
+    args_z: [*:0]const u8,
+    out: *tools.Buffer,
+};
+
+fn executeToolDefault(payload: *abi.EventPayload) callconv(.c) abi.Status {
+    const act: *ToolAction = @ptrCast(@alignCast(payload.action_ctx orelse return .err_internal));
+    return act.iface.execute(act.iface.impl, act.name_z, act.args_z, act.out);
+}
+
+/// 把这一轮的 tool_calls 拷进 session arena（它们原本指向临时 arena）。
     fn keepToolCalls(self: *Loop, calls: []const llm.ToolCall) ![]const llm.ToolCall {
         if (calls.len == 0) return &.{};
         const kept = try self.session_arena.alloc(llm.ToolCall, calls.len);
@@ -270,6 +387,7 @@ const TestEnv = struct {
             &self.session,
             &self.tools_iface,
             null,
+            null,
             .{},
         );
     }
@@ -349,4 +467,115 @@ test "runTurn: 模型反复调工具时会在轮次上限停下来" {
     try env.loop.runTurn("停不下来");
 
     try std.testing.expectEqual(@as(usize, 2), replay.calls);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  事件总线接入：tool/call、tool/pre-execute、agent/request
+// ─────────────────────────────────────────────────────────────────────────
+
+/// 测试用的派发器：记录收到的事件，可选地否决工具或注入上下文。
+/// 它就是插件里那个监听器在宿主侧的等价形状 —— 同一套 ABI 签名。
+const TestDispatcher = struct {
+    seen: [8][]const u8 = undefined,
+    n: usize = 0,
+    /// true = 否决一切工具执行
+    deny_tools: bool = false,
+    /// 非空 = agent/request 时注入这段文本
+    inject: []const u8 = "",
+
+    fn call(
+        ctx: *anyopaque,
+        payload: *abi.EventPayload,
+        mode: abi.DispatchMode,
+    ) callconv(.c) abi.Status {
+        const self: *TestDispatcher = @ptrCast(@alignCast(ctx));
+        const name = std.mem.span(payload.name);
+        if (self.n < self.seen.len) {
+            self.seen[self.n] = name;
+            self.n += 1;
+        }
+
+        return switch (mode) {
+            .emit => .ok,
+            .waterfall => blk: {
+                if (std.mem.eql(u8, name, abi.EventNames.tool_pre_execute) and self.deny_tools) {
+                    payload.setOut("被测试规则拒绝");
+                    // 不调 default_action = 工具不会执行
+                    break :blk .err_denied;
+                }
+                if (std.mem.eql(u8, name, abi.EventNames.agent_request) and self.inject.len > 0) {
+                    payload.setOut(self.inject);
+                }
+                // 放行：链尾默认行为该跑就跑
+                if (payload.default_action) |act| break :blk act(payload);
+                break :blk .ok;
+            },
+            else => .ok,
+        };
+    }
+};
+
+test "接入事件总线：每轮发 agent/request，每次工具调用发 tool/call 与 tool/pre-execute" {
+    var replay = llm.ReplayTransport{ .responses = &.{ round_with_tool_call, round_final }, .gpa = std.testing.allocator };
+    defer replay.deinit();
+    var env: TestEnv = undefined;
+    try env.init(&replay);
+    defer env.deinit();
+
+    var disp = TestDispatcher{};
+    env.loop.dispatcher = .{ .ctx = @ptrCast(&disp), .call = TestDispatcher.call };
+
+    try env.loop.runTurn("帮我 echo 一下");
+
+    // 顺序：第一轮请求前 -> 工具广播 -> 工具执行前 -> 第二轮请求前
+    try std.testing.expectEqual(@as(usize, 4), disp.n);
+    try std.testing.expectEqualStrings(abi.EventNames.agent_request, disp.seen[0]);
+    try std.testing.expectEqualStrings(abi.EventNames.tool_call, disp.seen[1]);
+    try std.testing.expectEqualStrings(abi.EventNames.tool_pre_execute, disp.seen[2]);
+    try std.testing.expectEqualStrings(abi.EventNames.agent_request, disp.seen[3]);
+
+    // 链尾默认行为真的执行了工具
+    const msgs = env.session.messages.items;
+    try std.testing.expect(std.mem.indexOf(u8, msgs[2].content, "hello-from-tool") != null);
+}
+
+test "权限门：监听器否决 -> 工具根本没执行，原因回给模型" {
+    var replay = llm.ReplayTransport{ .responses = &.{ round_with_tool_call, round_final }, .gpa = std.testing.allocator };
+    defer replay.deinit();
+    var env: TestEnv = undefined;
+    try env.init(&replay);
+    defer env.deinit();
+
+    var disp = TestDispatcher{ .deny_tools = true };
+    env.loop.dispatcher = .{ .ctx = @ptrCast(&disp), .call = TestDispatcher.call };
+
+    try env.loop.runTurn("帮我 echo 一下");
+
+    const msgs = env.session.messages.items;
+    try std.testing.expectEqual(@as(usize, 4), msgs.len);
+    // 工具结果里是拒绝原因，**不是**命令输出 —— 说明它真的没跑
+    try std.testing.expect(std.mem.indexOf(u8, msgs[2].content, "拒绝") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msgs[2].content, "hello-from-tool") == null);
+    // 循环没被打断：模型仍然拿到了这一轮的答复
+    try std.testing.expectEqualStrings("完成了", msgs[3].content);
+}
+
+test "agent/request：注入的上下文进了请求体，但不进会话历史" {
+    var replay = llm.ReplayTransport{ .responses = &.{round_final}, .gpa = std.testing.allocator };
+    defer replay.deinit();
+    var env: TestEnv = undefined;
+    try env.init(&replay);
+    defer env.deinit();
+
+    var disp = TestDispatcher{ .inject = "额外上下文-ABC" };
+    env.loop.dispatcher = .{ .ctx = @ptrCast(&disp), .call = TestDispatcher.call };
+
+    try env.loop.runTurn("你好");
+
+    // 请求体里能看到注入的文本
+    try std.testing.expect(std.mem.indexOf(u8, replay.last_request, "额外上下文-ABC") != null);
+    // 但它没有沾污会话历史：下一轮重新组装请求时它不会重现
+    for (env.session.messages.items) |m| {
+        try std.testing.expect(std.mem.indexOf(u8, m.content, "额外上下文-ABC") == null);
+    }
 }

@@ -228,13 +228,18 @@ pub const Client = struct {
     }
 
     /// 发一次请求并解析回复。arena 负责这次请求涉及的全部临时内存。
+    ///
+    /// `extra_system` 是本次请求**额外注入**的 system 内容（空 = 不注入）。
+    /// 它只活在这一份请求体里，不进会话历史 —— 插件的「注入检索到的上下文」
+    /// 就是走这条路（见 agent/request 事件）。
     pub fn complete(
         self: *Client,
         arena: std.mem.Allocator,
         session: *const Session,
         tools_json: []const u8,
+        extra_system: []const u8,
     ) !Completion {
-        const body = try buildRequest(arena, self.cfg, session, tools_json);
+        const body = try buildRequest(arena, self.cfg, session, tools_json, extra_system);
         const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.api_key});
         const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{self.cfg.base_url});
 
@@ -255,6 +260,7 @@ pub fn buildRequest(
     cfg: Config,
     session: *const Session,
     tools_json: []const u8,
+    extra_system: []const u8,
 ) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -262,9 +268,19 @@ pub fn buildRequest(
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(cfg.model, .{}, w);
     try w.writeAll(",\"messages\":[");
+    var written: usize = 0;
     for (session.messages.items, 0..) |m, i| {
-        if (i > 0) try w.writeAll(",");
+        if (written > 0) try w.writeAll(",");
         try writeMessage(w, m);
+        written += 1;
+
+        // 注入的额外上下文紧跟第一条（system）之后：放在最前面让模型一定看到，
+        // 但又不沾污会话历史（它只是这一份请求体里的临时内容）。
+        if (i == 0 and extra_system.len > 0) {
+            try w.writeAll(",");
+            try writeMessage(w, .{ .role = .system, .content = extra_system });
+            written += 1;
+        }
     }
     try w.writeAll("]");
 
@@ -417,7 +433,7 @@ test "buildRequest: 产物是合法 JSON，转义正确" {
     });
     try session.append(.{ .role = .tool, .tool_call_id = "c1", .content = "a\nb" });
 
-    const body = try buildRequest(a, .{}, &session, "[]");
+    const body = try buildRequest(a, .{}, &session, "[]", "");
     // 能原样解析回来 = 转义正确；手拼 JSON 最容易在这里出错
     const v = try std.json.parseFromSlice(std.json.Value, a, body, .{});
     try std.testing.expectEqualStrings("deepseek-flash", v.value.object.get("model").?.string);
@@ -443,7 +459,7 @@ test "complete: 走回放传输，端到端不联网" {
     var session = Session.init(a);
     try session.append(.{ .role = .user, .content = "看看目录" });
 
-    const c = try client.complete(a, &session, "[]");
+    const c = try client.complete(a, &session, "[]", "");
     try std.testing.expectEqual(@as(usize, 1), c.tool_calls.len);
     try std.testing.expect(std.mem.indexOf(u8, replay.last_request, "看看目录") != null);
 }
@@ -459,5 +475,5 @@ test "complete: 非 200 时报错而不是硬吞" {
     var session = Session.init(a);
     try session.append(.{ .role = .user, .content = "hi" });
 
-    try std.testing.expectError(error.HttpStatusNotOk, client.complete(a, &session, "[]"));
+    try std.testing.expectError(error.HttpStatusNotOk, client.complete(a, &session, "[]", ""));
 }

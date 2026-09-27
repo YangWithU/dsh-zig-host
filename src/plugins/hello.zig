@@ -64,6 +64,22 @@ fn onPing(user: *anyopaque, payload: *abi.EventPayload, next_ctx: *anyopaque, ne
     return next(next_ctx, payload);
 }
 
+/// 监听 tool/pre-execute：只观察、然后放行。
+/// 它存在的意义是：在**真实对话**里确认 loop 确实每次工具调用前都发了事件
+/// （日志里会出现「工具即将执行 …」）。真正的权限门插件会在 next() 之前决定
+/// 是否放行，这里只是探针。
+fn onToolPre(user: *anyopaque, payload: *abi.EventPayload, next_ctx: *anyopaque, next: abi.NextFn) callconv(.c) abi.Status {
+    _ = user;
+    if (saved_api) |api| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "工具即将执行：{s}", .{
+            std.mem.span(payload.json),
+        }) catch "工具即将执行";
+        api.log(api.ctx, .info, msg.ptr);
+    }
+    return next(next_ctx, payload);
+}
+
 /// 先放行、拿到内层结果再改写（waterfall 的典型用法）。
 /// 这就是「插件动态改 system prompt」将来要走的路：宿主把默认值预先写进
 /// payload.out，插件在链上把它换掉。
@@ -118,6 +134,10 @@ pub export fn dsh_plugin_init(
         return .err_internal;
     }
     if (api.on_event(api.ctx, EVENT_PROMPT, onPrompt, @ptrCast(&state)).id == 0) {
+        return .err_internal;
+    }
+    // 真实事件：loop 每次工具调用前发的那个（只观察，不拦）
+    if (api.on_event(api.ctx, abi.EventNames.tool_pre_execute, onToolPre, @ptrCast(&state)).id == 0) {
         return .err_internal;
     }
 
