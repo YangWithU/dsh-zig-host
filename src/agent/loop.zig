@@ -11,11 +11,18 @@
 //!           下一轮的 role=tool 消息就没有对应的 tool_call_id，协议直接不合法。
 //!
 //! 生命周期: 历史里的每个字符串都拷进 session_arena（会话级），不指向临时缓冲区。
-//!           另外，Loop 是**借用** client / session / host 的（内部存的是指针），
-//!           所以这三者的地址一旦变化（结构体被拷贝、对象被移动），指针立即失效。
-//!           调用方让它们与 Loop 活在同一作用域，并且不要把 Loop 拷走。
+//!           另外，Loop 是**借用** client / session / tools_iface 的（内部存的是
+//!           指针），所以这三者的地址一旦变化（结构体被拷贝、对象被移动），指针
+//!           立即失效。调用方让它们与 Loop 活在同一作用域，并且不要把 Loop 拷走。
+//!
+//! 与工具的关系（移植完成后的形态）: loop **不认识任何工具名**。它把模型给的
+//!           名字与参数原样交给工具表服务，连「未知工具」这种回答也是工具表写在
+//!           out 里的一段文字，loop 只负责搬运。所以工具在哪个 .so 里、有几个、
+//!           叫什么，对 loop 完全不可见。
 
 const std = @import("std");
+const abi = @import("dsh_abi");
+const tool_api = @import("dsh_tools");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const context_files = @import("context_files.zig");
@@ -35,7 +42,8 @@ pub const Loop = struct {
     io: std.Io,
     client: *llm.Client,
     session: *llm.Session,
-    host: *tools.Host,
+    /// 工具表服务（来自工具插件；测试里由 builtinIface 包一份宿主内的表）
+    tools_iface: *const tool_api.ToolsIface,
     /// 会话日志（可为 null：记录不是硬依赖）
     log: ?*session_log.Log = null,
     tools_json: []const u8,
@@ -50,12 +58,13 @@ pub const Loop = struct {
         dir: std.Io.Dir,
         client: *llm.Client,
         session: *llm.Session,
-        host: *tools.Host,
+        tools_iface: *const tool_api.ToolsIface,
         log: ?*session_log.Log,
         cfg: Config,
     ) !Loop {
-        // 工具清单与 system 提示只组装一次 —— 它们在一次会话里不会变
-        const tools_json = try tools.jsonSpec(session_arena);
+        // 工具清单与 system 提示只组装一次 —— 它们在一次会话里不会变。
+        // 工具清单是从工具表现读的：宿主并不知道里面有什么。
+        const tools_json = try tools.jsonSpec(session_arena, tools_iface);
         const system_prompt = try buildSystemPrompt(session_arena, io, dir);
 
         const self = Loop{
@@ -64,7 +73,7 @@ pub const Loop = struct {
             .io = io,
             .client = client,
             .session = session,
-            .host = host,
+            .tools_iface = tools_iface,
             .log = log,
             .tools_json = tools_json,
             .system_prompt = system_prompt,
@@ -135,18 +144,21 @@ pub const Loop = struct {
     }
 
     /// 执行一个工具调用，返回可长期保存（已拷进 session arena）的结果文本。
+    ///
+    /// ★ 这里**不出现任何工具名**：名字与参数原样交给工具表，由它去认。
+    ///   「未知工具」也是它给出的回答（写在 out 里的一段文字），loop 只负责搬运。
     fn runTool(self: *Loop, ta: std.mem.Allocator, call: llm.ToolCall) ![]const u8 {
-        const t = tools.find(call.name) orelse {
-            const msg = try std.fmt.allocPrint(self.session_arena, "未知工具：{s}", .{call.name});
-            std.debug.print("[tool] {s} -> 未知工具\n", .{call.name});
-            return msg;
-        };
-
-        // 工具签名要 C 字符串（将来跨 ABI 的形态）
+        // 跨 ABI 的参数要 C 字符串
+        const name_z = try ta.dupeZ(u8, call.name);
         const args_z = try ta.dupeZ(u8, call.arguments_json);
 
         var out = tools.Buffer{ .ptr = self.tool_buf.ptr, .cap = self.tool_buf.len, .len = 0 };
-        const status = t.exec(self.host, args_z.ptr, &out);
+        const status = self.tools_iface.execute(
+            self.tools_iface.impl,
+            name_z.ptr,
+            args_z.ptr,
+            &out,
+        );
 
         const text = out.slice();
         if (status != .ok) {
@@ -224,6 +236,7 @@ const TestEnv = struct {
     scratch_state: std.heap.ArenaAllocator,
     session: llm.Session,
     host: tools.Host,
+    tools_iface: tool_api.ToolsIface,
     client: llm.Client,
     loop: Loop,
 
@@ -242,10 +255,23 @@ const TestEnv = struct {
             .io = io,
             .dir = std.Io.Dir.cwd(),
         };
+        // 单元测试用宿主内那份工具表包一个 iface，这样不必依赖
+        // zig-out/lib/libtools.so 存在（插件路径由集成测试覆盖）。
+        self.tools_iface = tools.builtinIface(&self.host);
         self.client = llm.Client.init(arena, .{}, "fake-key", replay.asTransport());
         // 参数是 *TestEnv 而不是返回值：Loop 里存的是 &self.client 这类指针，
         // TestEnv 一旦被拷贝（返回结构体值），这些指针就悬空了。
-        self.loop = try Loop.init(gpa, arena, io, std.Io.Dir.cwd(), &self.client, &self.session, &self.host, null, .{});
+        self.loop = try Loop.init(
+            gpa,
+            arena,
+            io,
+            std.Io.Dir.cwd(),
+            &self.client,
+            &self.session,
+            &self.tools_iface,
+            null,
+            .{},
+        );
     }
 
     fn deinit(self: *TestEnv) void {

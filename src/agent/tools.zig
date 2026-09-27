@@ -82,27 +82,81 @@ pub fn find(name: []const u8) ?Tool {
     return null;
 }
 
-/// 生成请求体里 `tools` 字段所需的 JSON 数组文本（OpenAI 格式）。
+/// 从工具表服务生成请求体里 `tools` 字段所需的 JSON 数组（OpenAI 格式）。
+///
+/// ★ 描述与 Schema **全部从工具表读** —— 宿主编译期不认识任何一个工具。
+///   生产环境下 iface 来自工具插件；单元测试用 builtinIface 包一份宿主内的表。
 ///
 /// name/description 用序列化（它们可能含引号），parameters_json 直接嵌入 ——
-/// 它本身就是我们写死的合法 JSON Schema。
-pub fn jsonSpec(arena: std.mem.Allocator) ![]const u8 {
+/// 它本身就是对方写好的合法 JSON Schema。
+pub fn jsonSpec(arena: std.mem.Allocator, iface: *const tool_api.ToolsIface) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
 
     try w.writeAll("[");
-    for (all, 0..) |t, i| {
-        if (i > 0) try w.writeAll(",");
+    var written: usize = 0;
+    const n = iface.count(iface.impl);
+    for (0..n) |i| {
+        const spec = iface.at(iface.impl, i) orelse continue;
+        if (written > 0) try w.writeAll(",");
+        written += 1;
         try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-        try std.json.Stringify.value(std.mem.span(t.spec.name), .{}, w);
+        try std.json.Stringify.value(std.mem.span(spec.name), .{}, w);
         try w.writeAll(",\"description\":");
-        try std.json.Stringify.value(std.mem.span(t.spec.description), .{}, w);
+        try std.json.Stringify.value(std.mem.span(spec.description), .{}, w);
         try w.writeAll(",\"parameters\":");
-        try w.writeAll(std.mem.span(t.spec.parameters_json));
+        try w.writeAll(std.mem.span(spec.parameters_json));
         try w.writeAll("}}");
     }
     try w.writeAll("]");
     return aw.written();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  把宿主内这份工具表包成 ToolsIface
+//
+//  用途有两个，都是「不想加载 .so 的场合」：
+//    · 单元测试：loop 的测试不该依赖 zig-out/lib/libtools.so 存在
+//    · --tool 调试入口：直接调一个工具看行为，不需要跑插件装配
+//  生产路径上 iface 来自插件（context.get_service("tools")）。
+// ───────────────────────────────────────────────────────────────────────────
+
+fn builtinCount(impl: *anyopaque) callconv(.c) usize {
+    _ = impl;
+    return all.len;
+}
+
+fn builtinAt(impl: *anyopaque, index: usize) callconv(.c) ?*const ToolSpec {
+    _ = impl;
+    if (index >= all.len) return null;
+    return &all[index].spec;
+}
+
+fn builtinExecute(
+    impl: *anyopaque,
+    name: [*:0]const u8,
+    args_json: [*:0]const u8,
+    out: *Buffer,
+) callconv(.c) abi.Status {
+    const host: *Host = @ptrCast(@alignCast(impl));
+    const t = find(std.mem.span(name)) orelse {
+        // 与插件版行为保持一致：未知工具不崩，把原因写进 out
+        var w = out.writer();
+        w.print("未知工具：{s}", .{std.mem.span(name)}) catch {};
+        out.finish(&w);
+        return .err_invalid_arg;
+    };
+    return t.exec(host, args_json, out);
+}
+
+/// 把内置工具表包装成 ToolsIface（impl 就是传入的 host）。
+pub fn builtinIface(host: *Host) tool_api.ToolsIface {
+    return .{
+        .impl = @ptrCast(host),
+        .count = builtinCount,
+        .at = builtinAt,
+        .execute = builtinExecute,
+    };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -166,12 +220,23 @@ fn oomOrInternal(out: *Buffer, e: anyerror) abi.Status {
     return if (e == error.OutOfMemory) .err_oom else .err_internal;
 }
 
-test "jsonSpec: 生成的工具数组是合法 JSON，且条目数与工具表一致" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+test "jsonSpec: 能从工具表生成合法 JSON，条目数一致" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const spec = try jsonSpec(a);
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
+    var host = Host{
+        .gpa = gpa,
+        .scratch = scratch_state.allocator(),
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+    };
+    const iface = builtinIface(&host);
+
+    const spec = try jsonSpec(a, &iface);
     const v = try std.json.parseFromSlice(std.json.Value, a, spec, .{});
     try std.testing.expectEqual(@as(usize, all.len), v.value.array.items.len);
 

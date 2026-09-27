@@ -21,12 +21,12 @@
 //!   阶段 5  agent+四工具  agent/llm.zig  agent/loop.zig  agent/tools.zig
 //!   装配                  host/context.zig（阶段 1–3）、本文件
 //!
-//! 插件装配路径见文件末尾 `runWithPlugins`：故意不调用（理由见其注释）。
-
+//! 工具由插件提供（libtools.so）：宿主与 agent loop **编译期不认识任何一个
+//! 工具** —— 名字、描述、实现全部在运行时从服务表读（见 runAgent 的装配段）。
 const std = @import("std");
 const abi = @import("dsh_abi");
 const Context = @import("host/context.zig").Context;
-const hotreload = @import("host/hotreload.zig");
+const tool_api = @import("dsh_tools");
 const tools = @import("agent/tools.zig");
 const context_files = @import("agent/context_files.zig");
 const llm = @import("agent/llm.zig");
@@ -92,15 +92,29 @@ fn runAgent(
     var session = llm.Session.init(gpa);
     defer session.deinit();
 
-    // 工具内部用的临时分配器，每次调用前不重置也没关系（arena 会一直涨到会话结束）
-    var scratch_state = std.heap.ArenaAllocator.init(gpa);
-    defer scratch_state.deinit();
-    var host = tools.Host{
-        .gpa = gpa,
-        .scratch = scratch_state.allocator(),
-        .io = io,
-        .dir = std.Io.Dir.cwd(),
-    };
+    // 工具来自插件：装配宿主 -> 挂上工具插件 -> 从服务表取工具表。
+    // 宿主与这个 loop 编译期不认识任何一个工具 —— 这正是搬家要达到的结果。
+    var ctx = Context.init(gpa, io);
+    defer ctx.deinit();
+
+    const tools_path = "zig-out/lib/libtools.so";
+    switch (ctx.mountPlugin(tools_path, "{}")) {
+        .ok => {},
+        .failed => |st| {
+            std.debug.print(
+                "无法加载工具插件 {s}（{s}）。先跑一次 zig build 把插件构建出来。\n",
+                .{ tools_path, @tagName(st) },
+            );
+            return error.ToolsPluginUnavailable;
+        },
+    }
+
+    const tools_iface: *const tool_api.ToolsIface = @ptrCast(@alignCast(
+        ctx.registry.get(tool_api.SERVICE_NAME, 0) orelse {
+            std.debug.print("工具插件没有注册 {s} 服务\n", .{tool_api.SERVICE_NAME});
+            return error.ToolsServiceMissing;
+        },
+    ));
 
     // 会话日志：建不了就无日志继续跑 —— 记录是辅助，不该挡住对话
     const cwd = try std.process.currentPathAlloc(io, gpa);
@@ -126,7 +140,7 @@ fn runAgent(
         std.Io.Dir.cwd(),
         &client,
         &session,
-        &host,
+        tools_iface,
         if (log) |*l| l else null,
         .{},
     );
@@ -137,8 +151,16 @@ fn runAgent(
         return;
     }
 
+    std.debug.print("dsh_zig REPL。可用工具：", .{});
+    // 连这行提示都是从插件读的 —— 工具名字不在宿主代码里
+    const tool_count = tools_iface.count(tools_iface.impl);
+    for (0..tool_count) |i| {
+        const spec = tools_iface.at(tools_iface.impl, i) orelse continue;
+        if (i > 0) std.debug.print(" / ", .{});
+        std.debug.print("{s}", .{std.mem.span(spec.name)});
+    }
     std.debug.print(
-        \\dsh_zig REPL。可用工具：read / write / edit / bash。
+        \\
         \\直接描述你想做的事；输入 exit 或 Ctrl-D 退出。
         \\
     , .{});
@@ -183,11 +205,6 @@ fn runContextCli(gpa: std.mem.Allocator, io: std.Io) !void {
 /// 存在的意义：工具的正确性不该等到 LLM 接上才能验证 —— 那会把两类错误
 /// （工具写错了 / 接线接错了）混在一起，最难查。
 fn runToolCli(gpa: std.mem.Allocator, io: std.Io, name: []const u8, args_json: []const u8) !void {
-    const t = tools.find(name) orelse {
-        std.debug.print("未知工具：{s}（可用：read / write / edit / bash）\n", .{name});
-        return;
-    };
-
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
 
@@ -197,45 +214,22 @@ fn runToolCli(gpa: std.mem.Allocator, io: std.Io, name: []const u8, args_json: [
         .io = io,
         .dir = std.Io.Dir.cwd(),
     };
+    // 这个入口走宿主内那份工具表（包成 iface）—— 它的用途就是「不加载 .so、
+    // 不联网地验证单个工具」，所以不该反过来依赖插件构建。
+    const iface = tools.builtinIface(&host);
 
     const buf = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(buf);
     var out = tools.Buffer{ .ptr = buf.ptr, .cap = buf.len };
 
-    // 命令行给的是 Zig 风格的 slice，工具签名要 [*:0]const u8（将来跨 ABI 的形态）
+    // 命令行给的是 Zig 风格的 slice，工具签名要 [*:0]const u8（跨 ABI 的形态）
+    const name_z = try gpa.dupeZ(u8, name);
+    defer gpa.free(name_z);
     const args_z = try gpa.dupeZ(u8, args_json);
     defer gpa.free(args_z);
 
-    const status = t.exec(&host, args_z.ptr, &out);
+    const status = iface.execute(iface.impl, name_z.ptr, args_z.ptr, &out);
     std.debug.print("[{s} -> {s}]\n{s}", .{ name, @tagName(status), out.slice() });
-}
-
-/// 插件装配路径（阶段 1–4 的产物在这里被缝到一起）。
-///
-/// MVP 阶段故意不调用：Context.init 等仍是 @panic("TODO")，调它必崩。
-/// 留在这里是为了让「宿主 -> 插件 -> agent」的装配关系不丢，等阶段 1–3
-///    实现后由 main 按开关切回来；届时 agent 循环直接复用 MVP 的 loop。
-fn runWithPlugins(gpa: std.mem.Allocator, io: std.Io) !void {
-    // ── 装配宿主（阶段 1–3 的产物在这里被缝到一起） ───────────────────────
-    var ctx = Context.init(gpa, io);
-    defer ctx.deinit();
-
-    // ── 阶段 1：挂一个插件，验证装卸闭环 ─────────────────────────────────
-    //   内置插件：路径为 null，代码编译进宿主
-    //   外部插件：指向 .so，运行时 dlopen（产物名带指纹，见 hotreload.PluginSpec）
-    const tools_plugin = try ctx.mountPlugin("zig-out/lib/libtools.so", "{}");
-    defer ctx.unmountPlugin(tools_plugin);
-
-    // ── 阶段 4：热重载监视 ───────────────────────────────────────────────
-    //   每轮：poll → compile（新文件名）→ inspect → 拆旧 → 装新 → 重放依赖
-    var watcher = hotreload.Watcher.init(gpa, &.{"src/plugins"});
-    var spec = hotreload.PluginSpec{
-        .source_path = "src/plugins/tools.zig",
-        .output_path = "zig-out/lib/libtools.so",
-        .current = tools_plugin,
-    };
-    const report = hotreload.reloadOnce(&watcher, &spec, io);
-    _ = report; // ReloadReport.outcome 里有 ok/compile_failed/... 供上层决策
 }
 
 /// 编译插件 .so 的命令行（阶段 4 会 fork/exec 它）。
