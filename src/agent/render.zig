@@ -35,6 +35,14 @@ pub const Renderer = struct {
     show_tools: bool = true,
     /// 是否显示状态（默认关：它在交互终端里只是噪音）
     show_status: bool = false,
+
+    /// 是否正在流式输出。**跨事件的状态**：流式段落里首段要打前缀、后续段直接
+    /// 接上；等到下一个非 delta 事件到来时才能补那个换行。
+    streaming: bool = false,
+
+    /// 本轮的文本是否已经通过流式增量显示过了。
+    /// 用来避免「delta 早就把文本显示完，紧接着的完整 assistant-text 又打一遍」。
+    streamed: bool = false,
 };
 
 /// 某个事件关心的载荷上限。超出就截断 —— 渲染层不该因为一条超长消息炸掉。
@@ -55,7 +63,7 @@ pub fn onEvent(
     if (self.enabled) {
         var buf: [max_text]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        renderTo(&w, std.mem.span(payload.name), std.mem.span(payload.json), self.*) catch {};
+        renderTo(&w, std.mem.span(payload.name), std.mem.span(payload.json), self) catch {};
         if (w.buffered().len > 0) std.debug.print("{s}", .{w.buffered()});
     }
 
@@ -63,13 +71,34 @@ pub fn onEvent(
 }
 
 /// 纯渲染：把一条事件写进 writer。不打印、不碰终端 —— 所以能被直接测试。
+///
+/// `opts` 是**可变**的：流式输出需要跨事件记住「当前是不是正在接续一段文本」。
 pub fn renderTo(
     w: *std.Io.Writer,
     event: []const u8,
     json: []const u8,
-    opts: Renderer,
+    opts: *Renderer,
 ) !void {
+    // 流式增量单独处理：它要在同一行里继续追加，不能每段都打前缀
+    if (std.mem.eql(u8, event, abi.EventNames.assistant_delta)) {
+        if (!opts.show_text) return;
+        return renderDelta(w, json, opts);
+    }
+
+    // 到了这里说明流式段落结束了（下一段将是别的东西）：把没打的换行补上。
+    // 这一步放在分派之前，否则 show_status=false 时就没有人会补它了。
+    if (opts.streaming) {
+        try w.writeAll("\n");
+        opts.streaming = false;
+    }
+
     if (std.mem.eql(u8, event, abi.EventNames.assistant_text)) {
+        // 刚流式输出过：文本已经在屏幕上了，这一条只剩「让上面那段把换行补上」
+        // 的作用，不能再打一遍。
+        if (opts.streamed) {
+            opts.streamed = false;
+            return;
+        }
         if (!opts.show_text) return;
         return renderText(w, json);
     }
@@ -86,6 +115,19 @@ pub fn renderTo(
         return renderStatus(w, json);
     }
     // 不认识的事件安静放过：将来加了新事件，旧渲染层不该报错
+}
+
+/// 流式的一段增量：首段打前缀，后续直接接上。
+fn renderDelta(w: *std.Io.Writer, json: []const u8, opts: *Renderer) !void {
+    var buf: [max_text]u8 = undefined;
+    const text = jsonStringField(json, "text", &buf) orelse return;
+    if (text.len == 0) return;
+    if (!opts.streaming) {
+        try w.writeAll("\n[助手] ");
+        opts.streaming = true;
+    }
+    opts.streamed = true;
+    try w.writeAll(text);
 }
 
 fn renderText(w: *std.Io.Writer, json: []const u8) !void {
@@ -230,7 +272,8 @@ fn jsonRawField(json: []const u8, key: []const u8) ?[]const u8 {
 test "renderTo: 助手文本（含转义换行）" {
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try renderTo(&w, abi.EventNames.assistant_text, "{\"text\":\"第一行\\n第二行\"}", .{});
+    var opts = Renderer{};
+    try renderTo(&w, abi.EventNames.assistant_text, "{\"text\":\"第一行\\n第二行\"}", &opts);
 
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "[助手] ") != null);
@@ -240,13 +283,14 @@ test "renderTo: 助手文本（含转义换行）" {
 test "renderTo: 工具调用显示工具名与命令摘要（参数是转义过的字符串）" {
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
+    var opts = Renderer{};
 
     // arguments 是**字符串**，里面的引号被转义过 —— 正好验证解码
     try renderTo(
         &w,
         abi.EventNames.tool_call,
         "{\"tool\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls *.zig\\\"}\"}",
-        .{},
+        &opts,
     );
 
     const out = w.buffered();
@@ -257,11 +301,12 @@ test "renderTo: 工具调用显示工具名与命令摘要（参数是转义过�
 test "renderTo: read 这类没有 command 的工具，退而显示 path" {
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
+    var opts = Renderer{};
     try renderTo(
         &w,
         abi.EventNames.tool_call,
         "{\"tool\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"src/main.zig\\\"}\"}",
-        .{},
+        &opts,
     );
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "src/main.zig") != null);
 }
@@ -269,7 +314,8 @@ test "renderTo: read 这类没有 command 的工具，退而显示 path" {
 test "renderTo: 工具结果显示成败与字节数" {
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try renderTo(&w, abi.EventNames.tool_result, "{\"tool\":\"bash\",\"ok\":true,\"bytes\":19}", .{});
+    var opts = Renderer{};
+    try renderTo(&w, abi.EventNames.tool_result, "{\"tool\":\"bash\",\"ok\":true,\"bytes\":19}", &opts);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "19") != null);
 }
@@ -277,12 +323,44 @@ test "renderTo: 工具结果显示成败与字节数" {
 test "renderTo: 关掉工具显示之后什么都不写；未知事件也不写" {
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try renderTo(&w, abi.EventNames.tool_call, "{\"tool\":\"bash\"}", .{ .show_tools = false });
+    var quiet = Renderer{ .show_tools = false };
+    try renderTo(&w, abi.EventNames.tool_call, "{\"tool\":\"bash\"}", &quiet);
     try std.testing.expectEqual(@as(usize, 0), w.buffered().len);
 
     var w2 = std.Io.Writer.fixed(&buf);
-    try renderTo(&w2, "some/future-event", "{\"x\":1}", .{});
+    var opts = Renderer{};
+    try renderTo(&w2, "some/future-event", "{\"x\":1}", &opts);
     try std.testing.expectEqual(@as(usize, 0), w2.buffered().len);
+}
+
+test "renderTo 流式：首段带前缀、后续接上、遇其他事件才换行" {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var opts = Renderer{};
+
+    try renderTo(&w, abi.EventNames.assistant_delta, "{\"text\":\"你好\"}", &opts);
+    try renderTo(&w, abi.EventNames.assistant_delta, "{\"text\":\"，我看看\"}", &opts);
+    // 第二段不能又打一遍前缀，也不能换行
+    try std.testing.expectEqualStrings("\n[助手] 你好，我看看", w.buffered());
+    try std.testing.expect(opts.streaming);
+
+    // 下一个非 delta 事件才收尾换行
+    try renderTo(&w, abi.EventNames.tool_call, "{\"tool\":\"bash\",\"arguments\":\"{}\"}", &opts);
+    try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "\n[助手] 你好，我看看\n"));
+    try std.testing.expect(!opts.streaming);
+}
+
+test "renderTo 流式：紧跟的完整文本不会被打第二遍" {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var opts = Renderer{};
+
+    try renderTo(&w, abi.EventNames.assistant_delta, "{\"text\":\"你好\"}", &opts);
+    try renderTo(&w, abi.EventNames.assistant_delta, "{\"text\":\"世界\"}", &opts);
+    // loop 在流式结束后会再发一次完整文本（非流式渲染靠它）
+    try renderTo(&w, abi.EventNames.assistant_text, "{\"text\":\"你好世界\"}", &opts);
+
+    try std.testing.expectEqualStrings("\n[助手] 你好世界\n", w.buffered());
 }
 
 test "jsonStringField: 解出转义、容忍冒号后的空白、找不到时返回 null" {

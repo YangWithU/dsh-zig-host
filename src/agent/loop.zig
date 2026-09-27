@@ -146,9 +146,20 @@ pub const Loop = struct {
             // 状态：开始想
             self.emitStatus(ta, "thinking");
 
-            const done = try self.client.complete(ta, self.session, self.tools_json, injected);
+            // 具名局部变量：它的地址会交给传输层，在整个请求期间必须有效
+            var delta_sink = DeltaSink{ .loop = self };
+            const done = try self.client.completeStream(
+                ta,
+                self.session,
+                self.tools_json,
+                injected,
+                .{
+                    .ctx = @ptrCast(&delta_sink),
+                    .on_data = DeltaSink.onDelta,
+                },
+            );
 
-            // 模型说了什么 —— 交给渲染层显示（loop 自己不再往终端写）
+            // 完整文本也发一次（渲染层靠它拿到收尾的换行；流式期间显示的是 delta）
             if (done.text.len > 0) {
                 self.emitEvent(abi.EventNames.assistant_text, try textJson(ta, done.text));
             }
@@ -277,7 +288,33 @@ pub const Loop = struct {
         self.emitEvent(abi.EventNames.agent_status, json);
     }
 
-    /// 把一次工具调用编成事件载荷 JSON。
+    /// 流式文本增量的落点：转成 assistant-delta 事件发出去。
+///
+/// 它在 C 回调里被调（没有分配器），所以载荷用栈上缓冲拼 —— 模型的一段
+/// delta 不会超过几 KB。
+const DeltaSink = struct {
+    loop: *Loop,
+
+    fn onDelta(ctx: *anyopaque, delta: []const u8) void {
+        const self: *DeltaSink = @ptrCast(@alignCast(ctx));
+        const d = self.loop.dispatcher orelse return;
+
+        var buf: [8 * 1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.writeAll("{\"text\":") catch return;
+        std.json.Stringify.value(delta, .{}, &w) catch return;
+        w.writeAll("}") catch return;
+        w.writeByte(0) catch return;
+
+        var p = abi.EventPayload{
+            .name = abi.EventNames.assistant_delta,
+            .json = @ptrCast(w.buffered().ptr),
+        };
+        _ = d.call(d.ctx, &p, .emit);
+    }
+};
+
+/// 把一次工具调用编成事件载荷 JSON。
 ///
 /// `arguments` 用**字符串**序列化（而不是把参数文本直接嵌进去）：模型给的参数
 /// 不保证是合法 JSON，直接嵌会把整个载荷弄坏，而载荷一坏，后面所有监听器都遭殃。
@@ -409,15 +446,25 @@ fn buildSystemPrompt(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![]c
 //  测试：全部走回放传输，但工具是真的执行（bash 跑一条无副作用的 echo）
 // ─────────────────────────────────────────────────────────────────────────
 
-const round_with_tool_call =
-    \\{"choices":[{"index":0,"message":{"role":"assistant","content":"",
-    \\"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash",
-    \\"arguments":"{\"command\":\"echo hello-from-tool\"}"}}]},"finish_reason":"tool_calls"}]}
-;
+/// 流式剧本：先输出一段文本，再把工具调用参数**切成两块**送过来，最后给结束原因。
+///
+/// 写成真正的 SSE 文本（`data: {...}\n`）而不是非流式 JSON：这样测试跑的是与
+/// 线上**同一条解析路径**，包括「一个 tool_call 的参数被拆成多个 chunk」这种最
+/// 容易写错的情况 —— 拼不对的话 arguments 就成了不合法 JSON，而模型那边看到的
+/// 将是一个用不了的工具调用。
+const sse_with_tool_call =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"我来跑一下\"}}]}\n" ++
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+    "\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\"}}]}}]}\n" ++
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0," ++
+    "\"function\":{\"arguments\":\"\\\"echo hello-from-tool\\\"}\"}}]}}]}\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n" ++
+    "data: [DONE]\n";
 
-const round_final =
-    \\{"choices":[{"index":0,"message":{"role":"assistant","content":"完成了"},"finish_reason":"stop"}]}
-;
+const sse_final =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"完成了\"}}]}\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n" ++
+    "data: [DONE]\n";
 
 const TestEnv = struct {
     arena_state: std.heap.ArenaAllocator,
@@ -471,7 +518,7 @@ const TestEnv = struct {
 };
 
 test "runTurn: 先调工具拿到结果，再给最终答复（完整往返）" {
-    var replay = llm.ReplayTransport{ .responses = &.{ round_with_tool_call, round_final }, .gpa = std.testing.allocator };
+    var replay = llm.ReplayTransport{ .responses = &.{ sse_with_tool_call, sse_final }, .gpa = std.testing.allocator };
     defer replay.deinit();
     var env: TestEnv = undefined;
     try env.init(&replay);
@@ -497,7 +544,7 @@ test "runTurn: 先调工具拿到结果，再给最终答复（完整往返）" 
 }
 
 test "runTurn: 第二轮请求确实带上了工具结果" {
-    var replay = llm.ReplayTransport{ .responses = &.{ round_with_tool_call, round_final }, .gpa = std.testing.allocator };
+    var replay = llm.ReplayTransport{ .responses = &.{ sse_with_tool_call, sse_final }, .gpa = std.testing.allocator };
     defer replay.deinit();
     var env: TestEnv = undefined;
     try env.init(&replay);
@@ -512,8 +559,10 @@ test "runTurn: 第二轮请求确实带上了工具结果" {
 }
 
 test "runTurn: 未知工具不中断循环，而是把原因回给模型" {
-    const unknown_tool = "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c9\",\"type\":\"function\",\"function\":{\"name\":\"frobnicate\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}";
-    var replay = llm.ReplayTransport{ .responses = &.{ unknown_tool, round_final }, .gpa = std.testing.allocator };
+    const unknown_tool = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c9\",\"function\":{\"name\":\"frobnicate\",\"arguments\":\"{}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n" ++
+        "data: [DONE]\n";
+    var replay = llm.ReplayTransport{ .responses = &.{ unknown_tool, sse_final }, .gpa = std.testing.allocator };
     defer replay.deinit();
     var env: TestEnv = undefined;
     try env.init(&replay);
@@ -528,7 +577,7 @@ test "runTurn: 未知工具不中断循环，而是把原因回给模型" {
 
 test "runTurn: 模型反复调工具时会在轮次上限停下来" {
     // 同一个响应给很多次：模型永远在调工具
-    var replay = llm.ReplayTransport{ .responses = &.{round_with_tool_call}, .gpa = std.testing.allocator };
+    var replay = llm.ReplayTransport{ .responses = &.{sse_with_tool_call}, .gpa = std.testing.allocator };
     defer replay.deinit();
     var env: TestEnv = undefined;
     try env.init(&replay);
@@ -603,7 +652,7 @@ fn countOf(d: *const TestDispatcher, name: []const u8) usize {
 }
 
 test "接入事件总线：每轮发 agent/request，每次工具调用发 tool/call -> pre-execute -> result" {
-    var replay = llm.ReplayTransport{ .responses = &.{ round_with_tool_call, round_final }, .gpa = std.testing.allocator };
+    var replay = llm.ReplayTransport{ .responses = &.{ sse_with_tool_call, sse_final }, .gpa = std.testing.allocator };
     defer replay.deinit();
     var env: TestEnv = undefined;
     try env.init(&replay);
@@ -624,10 +673,11 @@ test "接入事件总线：每轮发 agent/request，每次工具调用发 tool/
     try std.testing.expect(i_call < i_pre); // 广播在外，包裹在内
     try std.testing.expect(i_pre < i_res); // 结果在调用之后
 
-    // 两轮请求 -> 两次 agent/request；一条文本 -> 一次 assistant-text；
-    // 状态：thinking(轮1) / thinking(轮2) / idle(收尾) = 3 次
+    // 两轮请求 -> 两次 agent/request；两轮各有一段文本 -> 两次 assistant-text
+    // 与两条 delta；状态：thinking(轮1) / thinking(轮2) / idle(收尾) = 3 次
     try std.testing.expectEqual(@as(usize, 2), countOf(&disp, abi.EventNames.agent_request));
-    try std.testing.expectEqual(@as(usize, 1), countOf(&disp, abi.EventNames.assistant_text));
+    try std.testing.expectEqual(@as(usize, 2), countOf(&disp, abi.EventNames.assistant_text));
+    try std.testing.expectEqual(@as(usize, 2), countOf(&disp, abi.EventNames.assistant_delta));
     try std.testing.expectEqual(@as(usize, 3), countOf(&disp, abi.EventNames.agent_status));
 
     // 链尾默认行为真的执行了工具
@@ -636,7 +686,7 @@ test "接入事件总线：每轮发 agent/request，每次工具调用发 tool/
 }
 
 test "权限门：监听器否决 -> 工具根本没执行，原因回给模型" {
-    var replay = llm.ReplayTransport{ .responses = &.{ round_with_tool_call, round_final }, .gpa = std.testing.allocator };
+    var replay = llm.ReplayTransport{ .responses = &.{ sse_with_tool_call, sse_final }, .gpa = std.testing.allocator };
     defer replay.deinit();
     var env: TestEnv = undefined;
     try env.init(&replay);
@@ -657,7 +707,7 @@ test "权限门：监听器否决 -> 工具根本没执行，原因回给模型"
 }
 
 test "agent/request：注入的上下文进了请求体，但不进会话历史" {
-    var replay = llm.ReplayTransport{ .responses = &.{round_final}, .gpa = std.testing.allocator };
+    var replay = llm.ReplayTransport{ .responses = &.{sse_final}, .gpa = std.testing.allocator };
     defer replay.deinit();
     var env: TestEnv = undefined;
     try env.init(&replay);

@@ -14,6 +14,7 @@
 //! TLS 根证书由 std.http.Client 自动加载（不必手动指定 CA 路径）。
 
 const std = @import("std");
+const sse = @import("sse.zig");
 
 // ───────────────────────────────────────────────────────────────────────────
 //  消息与历史
@@ -103,6 +104,118 @@ pub const Response = struct {
     body: []const u8,
 };
 
+/// 把流式增量拼成一个 Completion。
+///
+/// 工具调用是这里的难点：`id` / `name` 只在第一块出现，`arguments` 会被切成
+/// 很多块，多路工具调用靠 `index` 区分 —— 所以要**按 index 累积**，不能假设
+/// 先后到达的块属于同一个调用（模型可以交错地往回送）。
+pub const StreamAccumulator = struct {
+    arena: std.mem.Allocator,
+    text: std.ArrayList(u8),
+    calls: std.ArrayList(ToolCall),
+    finish_reason: []const u8 = "",
+    prompt_tokens: u64 = 0,
+    completion_tokens: u64 = 0,
+    /// 解析出的错误。回调路径不能抛错，只能记下来由调用方事后查。
+    failed: bool = false,
+    /// 每收到一段文本就回调一次（渲染层靠它逐字显示）
+    on_text: ?Sink = null,
+
+    pub fn init(arena: std.mem.Allocator) StreamAccumulator {
+        return .{ .arena = arena, .text = .empty, .calls = .empty };
+    }
+
+    /// 消费一条 SSE `data:` 的内容（一个 OpenAI 流式 chunk）。
+    pub fn consume(self: *StreamAccumulator, data: []const u8) !void {
+        const Wire = struct {
+            choices: []const Choice = &.{},
+            usage: ?Usage = null,
+
+            const Choice = struct {
+                delta: ?Delta = null,
+                finish_reason: ?[]const u8 = null,
+            };
+            const Delta = struct {
+                content: ?[]const u8 = null,
+                tool_calls: ?[]const ToolCallDelta = null,
+            };
+            const ToolCallDelta = struct {
+                index: ?u32 = null,
+                id: ?[]const u8 = null,
+                function: ?Function = null,
+
+                const Function = struct {
+                    name: ?[]const u8 = null,
+                    arguments: ?[]const u8 = null,
+                };
+            };
+            const Usage = struct {
+                prompt_tokens: ?u64 = null,
+                completion_tokens: ?u64 = null,
+            };
+        };
+
+        const parsed = try std.json.parseFromSliceLeaky(Wire, self.arena, data, .{
+            .ignore_unknown_fields = true,
+        });
+
+        for (parsed.choices) |c| {
+            if (c.finish_reason) |f| self.finish_reason = f;
+
+            const delta = c.delta orelse continue;
+
+            if (delta.content) |piece| {
+                if (piece.len > 0) {
+                    try self.text.appendSlice(self.arena, piece);
+                    if (self.on_text) |s| s.on_data(s.ctx, piece);
+                }
+            }
+
+            for (delta.tool_calls orelse &.{}) |tc| {
+                const idx: usize = tc.index orelse 0;
+                // 稀疏扩容：多路调用可能先到 index=1 再到 index=0
+                while (self.calls.items.len <= idx) {
+                    try self.calls.append(self.arena, .{ .id = "", .name = "", .arguments_json = "" });
+                }
+                const slot = &self.calls.items[idx];
+                if (tc.id) |id| {
+                    slot.id = try std.mem.concat(self.arena, u8, &.{ slot.id, id });
+                }
+                if (tc.function) |f| {
+                    if (f.name) |n| {
+                        slot.name = try std.mem.concat(self.arena, u8, &.{ slot.name, n });
+                    }
+                    if (f.arguments) |a| {
+                        slot.arguments_json = try std.mem.concat(self.arena, u8, &.{ slot.arguments_json, a });
+                    }
+                }
+            }
+        }
+
+        if (parsed.usage) |u| {
+            if (u.prompt_tokens) |v| self.prompt_tokens = v;
+            if (u.completion_tokens) |v| self.completion_tokens = v;
+        }
+    }
+
+    pub fn finish(self: *StreamAccumulator) Completion {
+        return .{
+            .text = self.text.items,
+            .tool_calls = self.calls.items,
+            .finish_reason = self.finish_reason,
+            .prompt_tokens = self.prompt_tokens,
+            .completion_tokens = self.completion_tokens,
+        };
+    }
+};
+
+/// 流式回调：用「函数指针 + 上下文」而不是 Zig 闭包 —— 这条路径要走 C 风格的
+/// writer 回调，闭包在这里没有位置。
+pub const Sink = struct {
+    ctx: *anyopaque,
+    on_data: *const fn (ctx: *anyopaque, data: []const u8) void,
+};
+
 pub const Transport = struct {
     ctx: *anyopaque,
     send: *const fn (
@@ -112,6 +225,81 @@ pub const Transport = struct {
         auth: []const u8,
         body: []const u8,
     ) anyerror!Response,
+
+    /// 流式发送：每解析出一条 SSE `data:` 就回调一次。返回 HTTP 状态码。
+    sendStream: *const fn (
+        ctx: *anyopaque,
+        arena: std.mem.Allocator,
+        url: []const u8,
+        auth: []const u8,
+        body: []const u8,
+        sink: Sink,
+    ) anyerror!u16,
+};
+
+/// 挂在 HTTP 响应上的 writer：数据一到就喂给 SSE 解析器。
+///
+/// ★ buffer 容量为 0 是刻意的。Writer 只在「数据放不进 buffer」时才调 drain，
+///   给它一个非零 buffer 就意味着 SSE 事件先攒在 buffer 里、攒满才被处理 ——
+///   那就不是流式了（token 早就到了，界面上却不动）。
+///
+/// ⚠️ 必须在使用者自己的作用域里构造（`var s: StreamSink = undefined; s.init(...)`）。
+///    靠返回值拷贝不行：writer 靠 @fieldParentPtr 反查回它，地址一变就失效。
+const StreamSink = struct {
+    parser: sse.SseParser = .{},
+    sink: Sink,
+    writer: std.Io.Writer = undefined,
+    /// drain 只能抛 Writer.Error，业务错误记在这里
+    failed: bool = false,
+    /// 响应体的开头若干字节：非 200 时响应体不是 SSE，错误原因在里面，
+    /// 而流式路径不像非流式那样能把整个 body 留下来。
+    head: [400]u8 = undefined,
+    head_len: usize = 0,
+
+    fn init(self: *StreamSink, sink: Sink) void {
+        self.* = .{ .sink = sink };
+        self.writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 };
+    }
+
+    const vtable = std.Io.Writer.VTable{ .drain = drain };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
+
+        var total: usize = 0;
+        for (data, 0..) |chunk, i| {
+            // 最后一片可能要求重复 splat 次
+            const times = if (i + 1 == data.len) splat else 1;
+            var t: usize = 0;
+            while (t < times) : (t += 1) {
+                self.consume(chunk) catch {
+                    self.failed = true;
+                    return error.WriteFailed;
+                };
+                total += chunk.len;
+            }
+        }
+        return total;
+    }
+
+    fn consume(self: *StreamSink, chunk: []const u8) !void {
+        const room = self.head.len - self.head_len;
+        if (room > 0) {
+            const n = @min(room, chunk.len);
+            @memcpy(self.head[self.head_len..][0..n], chunk[0..n]);
+            self.head_len += n;
+        }
+
+        try self.parser.feed(chunk);
+        while (true) {
+            switch (self.parser.next()) {
+                .none => break,
+                .ignored => continue,
+                .done => break,
+                .data => |d| self.sink.on_data(self.sink.ctx, d),
+            }
+        }
+    }
 };
 
 pub const HttpTransport = struct {
@@ -126,7 +314,7 @@ pub const HttpTransport = struct {
     }
 
     pub fn asTransport(self: *HttpTransport) Transport {
-        return .{ .ctx = self, .send = send };
+        return .{ .ctx = self, .send = send, .sendStream = sendStream };
     }
 
     fn send(
@@ -159,6 +347,40 @@ pub const HttpTransport = struct {
         }
         return .{ .status = @intFromEnum(res.status), .body = aw.written() };
     }
+
+    fn sendStream(
+        ctx: *anyopaque,
+        arena: std.mem.Allocator,
+        url: []const u8,
+        auth: []const u8,
+        body: []const u8,
+        sink: Sink,
+    ) anyerror!u16 {
+        _ = arena;
+        const self: *HttpTransport = @ptrCast(@alignCast(ctx));
+
+        var stream: StreamSink = undefined;
+        stream.init(sink);
+
+        const res = try self.client.fetch(.{
+            .location = .{ .url = url },
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "accept", .value = "text/event-stream" },
+            },
+            .response_writer = &stream.writer,
+        });
+
+        const status = @intFromEnum(res.status);
+        if (status != 200) {
+            std.debug.print("[llm] HTTP {d}: {s}\n", .{ status, stream.head[0..stream.head_len] });
+        }
+        if (stream.failed) return error.SseParseFailed;
+        return status;
+    }
 };
 
 /// 回放：不联网，按顺序返回预先准备好的响应。
@@ -183,7 +405,46 @@ pub const ReplayTransport = struct {
     }
 
     pub fn asTransport(self: *ReplayTransport) Transport {
-        return .{ .ctx = self, .send = send };
+        return .{ .ctx = self, .send = send, .sendStream = sendStream };
+    }
+
+    fn sendStream(
+        ctx: *anyopaque,
+        arena: std.mem.Allocator,
+        url: []const u8,
+        auth: []const u8,
+        body: []const u8,
+        sink: Sink,
+    ) anyerror!u16 {
+        _ = arena;
+        _ = url;
+        _ = auth;
+        const self: *ReplayTransport = @ptrCast(@alignCast(ctx));
+
+        if (self.gpa) |g| {
+            if (self.last_request.len > 0) g.free(self.last_request);
+            self.last_request = try g.dupe(u8, body);
+        } else {
+            self.last_request = body;
+        }
+
+        defer self.calls += 1;
+        if (self.responses.len == 0) return self.status;
+
+        const idx = @min(self.calls, self.responses.len - 1);
+        // 剧本里放的就是**真正的 SSE 文本**（`data: {...}\n`）：这样测试跑的
+        // 是与线上同一条解析路径，而不是另写一份「假的流式」。
+        var parser = sse.SseParser{};
+        parser.feed(self.responses[idx]) catch return error.SseParseFailed;
+        while (true) {
+            switch (parser.next()) {
+                .none => break,
+                .ignored => continue,
+                .done => break,
+                .data => |d| sink.on_data(sink.ctx, d),
+            }
+        }
+        return self.status;
     }
 
     fn send(
@@ -239,7 +500,7 @@ pub const Client = struct {
         tools_json: []const u8,
         extra_system: []const u8,
     ) !Completion {
-        const body = try buildRequest(arena, self.cfg, session, tools_json, extra_system);
+        const body = try buildRequest(arena, self.cfg, session, tools_json, extra_system, false);
         const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.api_key});
         const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{self.cfg.base_url});
 
@@ -247,7 +508,47 @@ pub const Client = struct {
         if (res.status != 200) return error.HttpStatusNotOk;
         return parseResponse(arena, res.body);
     }
+
+    /// 流式发一次请求：文本增量通过 `on_text` **实时**回调，返回拼好的完整结果。
+    ///
+    /// 与非流式共用同一套请求体与解析器 —— 差别只在于数据是边到边处理的。
+    pub fn completeStream(
+        self: *Client,
+        arena: std.mem.Allocator,
+        session: *const Session,
+        tools_json: []const u8,
+        extra_system: []const u8,
+        on_text: ?Sink,
+    ) !Completion {
+        const body = try buildRequest(arena, self.cfg, session, tools_json, extra_system, true);
+        const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.api_key});
+        const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{self.cfg.base_url});
+
+        var acc = StreamAccumulator.init(arena);
+        acc.on_text = on_text;
+
+        const status = try self.transport.sendStream(
+            self.transport.ctx,
+            arena,
+            url,
+            auth,
+            body,
+            .{ .ctx = @ptrCast(&acc), .on_data = consumeInto },
+        );
+        if (status != 200) return error.HttpStatusNotOk;
+        if (acc.failed) return error.StreamParseFailed;
+        return acc.finish();
+    }
 };
+
+/// 流式回调桥：把每一条 SSE data 喂给累积器。
+/// 抛不了错（回调签名是 void），所以失败记在 acc.failed 上，调用方事后查。
+fn consumeInto(ctx: *anyopaque, data: []const u8) void {
+    const acc: *StreamAccumulator = @ptrCast(@alignCast(ctx));
+    acc.consume(data) catch {
+        acc.failed = true;
+    };
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 //  请求体组装
@@ -261,6 +562,7 @@ pub fn buildRequest(
     session: *const Session,
     tools_json: []const u8,
     extra_system: []const u8,
+    stream: bool,
 ) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -291,6 +593,7 @@ pub fn buildRequest(
     }
 
     try w.print(",\"max_tokens\":{d},\"temperature\":{d}", .{ cfg.max_tokens, cfg.temperature });
+    if (stream) try w.writeAll(",\"stream\":true");
     try w.writeAll("}");
     return aw.written();
 }
@@ -433,7 +736,7 @@ test "buildRequest: 产物是合法 JSON，转义正确" {
     });
     try session.append(.{ .role = .tool, .tool_call_id = "c1", .content = "a\nb" });
 
-    const body = try buildRequest(a, .{}, &session, "[]", "");
+    const body = try buildRequest(a, .{}, &session, "[]", "", false);
     // 能原样解析回来 = 转义正确；手拼 JSON 最容易在这里出错
     const v = try std.json.parseFromSlice(std.json.Value, a, body, .{});
     try std.testing.expectEqualStrings("deepseek-flash", v.value.object.get("model").?.string);

@@ -406,6 +406,10 @@ pub const EventNames = struct {
     /// 终端渲染层靠它显示「助手说了什么」。
     pub const assistant_text = "assistant-text";
 
+    /// 流式的一段增量文本（emit）。与 assistant-text 的区别：**这是一段增量，
+    /// 不是完整消息**。渲染层靠它逐字显示，所以在它到达时不能换行。
+    pub const assistant_delta = "assistant-delta";
+
     /// 一次工具调用结束（emit）：payload 是 {"tool":…,"ok":…,"bytes":…}。
     /// 与 tool_call 配对，一前一后。
     pub const tool_result = "tool/result";

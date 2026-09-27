@@ -9,5 +9,6 @@ test {
     _ = @import("llm.zig");
     _ = @import("loop.zig");
     _ = @import("render.zig");
+    _ = @import("sse.zig");
     _ = @import("session_log.zig");
 }
