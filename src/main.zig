@@ -312,5 +312,5 @@ comptime {
     // （ABI 是双方共享的冻结面，改动必须是有意识的 —— 每次有意变更后把下面
     //   的数字一起改掉，这本身就证明了「我是知情的」。）
     std.debug.assert(@sizeOf(abi.Handle) == 16);
-    std.debug.assert(abi.ABI_VERSION == 2);
+    std.debug.assert(abi.ABI_VERSION == 3);
 }

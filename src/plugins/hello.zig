@@ -2,12 +2,14 @@
 //!  最小插件 · hello —— 用来验证装卸闭环的探针
 //! ═══════════════════════════════════════════════════════════════════════════
 //!
-//! 它做三件事，每件都对应一条要被验证的机制：
+//! 它做四件事，每件都对应一条要被验证的机制：
 //!
 //!   1. init 里校验 ABI 版本 —— loader 已经挡过一道，这里再查一次是插件侧
 //!      的自我防卫（插件可能被非本项目的宿主加载）。
 //!   2. init 里注册一个服务   —— 验证「注册 + 宿主记账」这条链。
-//!   3. deinit 里打一句日志   —— 用来观察卸载时序（撤销 -> deinit -> dlclose）。
+//!   3. init 里注册两个事件监听 —— 验证跨 ABI 的回调：一个只观察（emit），
+//!      一个改写结果（waterfall）。
+//!   4. deinit 里打一句日志   —— 用来观察卸载时序（撤销 -> deinit -> dlclose）。
 //!
 //! ★ 为什么插件不导出 deinit 也能被正确清理
 //! ---------------------------------------------------------------------------
@@ -39,6 +41,43 @@ fn greetImpl(impl: *anyopaque) callconv(.c) u32 {
 /// 接口表的实例。做成静态的：**一个插件一份接口表，与实例数据（state）分开** ——
 /// 一个插件可以拿同一份接口表开多个实例，各自填自己的 impl。
 const greeter_iface = greeter.GreeterIface{ .greet = greetImpl };
+
+// ───────────────────────────────────────────────────────────────────────────
+//  两个事件监听器：验证跨 ABI 的回调真的能进插件代码
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 监听器自己的状态。Zig 没有闭包，插件要访问自己的数据只能靠 on_event 传来
+/// 的这个 user 指针。
+var ping_count: u32 = 0;
+
+/// 只观察、然后放行（emit 的典型用法）
+fn onPing(user: *anyopaque, payload: *abi.EventPayload, next_ctx: *anyopaque, next: abi.NextFn) callconv(.c) abi.Status {
+    const counter: *u32 = @ptrCast(@alignCast(user));
+    counter.* += 1;
+    if (saved_api) |api| {
+        var buf: [160]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "收到 {s}（累计 {d} 次）", .{
+            std.mem.span(payload.name), counter.*,
+        }) catch "收到事件";
+        api.log(api.ctx, .info, msg.ptr);
+    }
+    return next(next_ctx, payload);
+}
+
+/// 先放行、拿到内层结果再改写（waterfall 的典型用法）。
+/// 这就是「插件动态改 system prompt」将来要走的路：宿主把默认值预先写进
+/// payload.out，插件在链上把它换掉。
+fn onPrompt(user: *anyopaque, payload: *abi.EventPayload, next_ctx: *anyopaque, next: abi.NextFn) callconv(.c) abi.Status {
+    _ = user;
+    const st = next(next_ctx, payload);
+    if (st != .ok) return st;
+
+    var buf: [512]u8 = undefined;
+    const wrapped = std.fmt.bufPrint(&buf, "[hello 加料] {s}", .{payload.out()}) catch
+        return .err_too_large;
+    payload.setOut(wrapped);
+    return .ok;
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 //  插件导出的符号
@@ -73,8 +112,21 @@ pub export fn dsh_plugin_init(
     if (h.id == 0) return .err_duplicate;
 
     api.log(api.ctx, .info, "greeter 服务已注册");
+
+    // 两个监听：注册与记账同样成对（责任在宿主）
+    if (api.on_event(api.ctx, EVENT_PING, onPing, @ptrCast(&ping_count)).id == 0) {
+        return .err_internal;
+    }
+    if (api.on_event(api.ctx, EVENT_PROMPT, onPrompt, @ptrCast(&state)).id == 0) {
+        return .err_internal;
+    }
+
     return .ok;
 }
+
+/// 这个插件监听的事件名（测试与宿主都按它对表）
+pub const EVENT_PING = "demo/ping";
+pub const EVENT_PROMPT = "demo/prompt";
 
 /// 可选导出。宿主**不得依赖**它做清理（清理由宿主的撤销清单保证）。
 /// 它存在的意义是让我们能观察卸载时序：应当在撤销之后、dlclose 之前被调用。

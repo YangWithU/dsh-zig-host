@@ -56,7 +56,8 @@ test "真加载：dlopen -> init 注册服务 -> 卸载零残留" {
     try std.testing.expect(entry.owner == slot.fiber);
 
     // 记账成对：宿主在注册那一刻就记了一条撤销项
-    try std.testing.expectEqual(@as(usize, 1), slot.fiber.disposers.items.len);
+    // （一等服务 + 两个事件监听 = 三条账）
+    try std.testing.expectEqual(@as(usize, 3), slot.fiber.disposers.items.len);
 
     // ★ 真的调用插件里的代码 —— 魔数对得上，证明拿到的是那个 .so 里的函数
     const iface: *const greeter.GreeterIface = @ptrCast(@alignCast(entry.iface));
@@ -132,7 +133,7 @@ test "同一个 .so 挂两份：第二份因同名服务被拒 -> 加载失败 -
     try std.testing.expectEqual(@as(usize, 1), ctx.registry.count());
     try std.testing.expectEqual(fiber_mod.State.active, a.fiber.state);
     // 第一份的账也没被动（失败的那份没有往清单里塞任何东西）
-    try std.testing.expectEqual(@as(usize, 1), a.fiber.disposers.items.len);
+    try std.testing.expectEqual(@as(usize, 3), a.fiber.disposers.items.len);
 
     ctx.unmountPlugin(a);
     try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
@@ -236,6 +237,55 @@ test "tools 插件：列得出四个工具，且四个都真能执行" {
     out.len = 0;
     try std.testing.expect(tools.execute(tools.impl, "read", "not json", &out) != .ok);
     try std.testing.expect(out.slice().len > 0);
+}
+
+/// hello 插件监听的两个事件（必须与 hello.zig 里的常量一致；宿主编译期不认识
+/// 插件代码，所以只能在这里各写一遍 —— 写错了测试就会失败，这是可接受的）。
+const ping_event = "demo/ping";
+const prompt_event = "demo/prompt";
+
+test "事件总线跨 ABI：回调真的进了插件代码；waterfall 能改写结果" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const slot = try mountOrFail(&ctx, hello_path);
+
+    // 插件 init 里注册的两个监听进了总线
+    try std.testing.expectEqual(@as(usize, 2), ctx.bus.count());
+    try std.testing.expectEqual(@as(usize, 1), ctx.bus.countFor(ping_event));
+    try std.testing.expectEqual(@as(usize, 1), ctx.bus.countFor(prompt_event));
+    // 一份服务 + 两个监听 = 三条账
+    try std.testing.expectEqual(@as(usize, 3), slot.fiber.disposers.items.len);
+
+    // ① emit：回调研到的是 libhello.so 里的函数（会往日志打一行）
+    var ping_payload = abi.EventPayload{ .name = ping_event, .json = "{}" };
+    try std.testing.expectEqual(
+        abi.Status.ok,
+        slot.api.emit(slot.api.ctx, &ping_payload, .emit),
+    );
+
+    // ② waterfall：发布方先写「默认行为」，插件在链上把它改写掉
+    var out_buf: [256]u8 = undefined;
+    var prompt_payload = abi.EventPayload{
+        .name = prompt_event,
+        .json = "{}",
+        .out_ptr = &out_buf,
+        .out_cap = out_buf.len,
+    };
+    prompt_payload.setOut("base prompt");
+    try std.testing.expectEqual(
+        abi.Status.ok,
+        slot.api.emit(slot.api.ctx, &prompt_payload, .waterfall),
+    );
+    try std.testing.expectEqualStrings("[hello 加料] base prompt", prompt_payload.out());
+
+    // 卸载 -> 服务与监听一起消失
+    // （监听回调是插件里的函数地址，必须早于 dlclose 撤掉，否则下次分发就是段错误）
+    ctx.unmountPlugin(slot);
+    try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
+    try std.testing.expectEqual(@as(usize, 0), ctx.bus.count());
+    try std.testing.expectEqual(@as(usize, 0), ctx.fibers.items.len);
 }
 
 test "tools 插件：卸载后服务消失、登记表清零" {

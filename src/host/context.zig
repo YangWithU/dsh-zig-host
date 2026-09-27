@@ -55,6 +55,7 @@ const std = @import("std");
 const abi = @import("dsh_abi");
 const fiber_mod = @import("fiber.zig");
 const services = @import("services.zig");
+const events = @import("events.zig");
 const loader = @import("loader.zig");
 
 /// 交给某个插件的私有包装。
@@ -73,6 +74,7 @@ pub const Context = struct {
     io: std.Io,
 
     registry: services.Registry,
+    bus: events.Bus,
 
     /// 所有活着的 fiber。deinit 时逆序卸载。
     fibers: std.ArrayList(*fiber_mod.Fiber),
@@ -88,6 +90,7 @@ pub const Context = struct {
             .gpa = gpa,
             .io = io,
             .registry = services.Registry.init(gpa),
+            .bus = events.Bus.init(gpa),
             .fibers = .empty,
             .slots = .empty,
         };
@@ -107,6 +110,7 @@ pub const Context = struct {
         self.slots.deinit(self.gpa);
 
         self.registry.deinit();
+        self.bus.deinit();
     }
 
     /// 建一个 fiber（此时**不**加载代码），并配好它专属的 HostApi。
@@ -313,19 +317,58 @@ pub const Context = struct {
         return @constCast(iface);
     }
 
-    /// HostApi.on_event：事件总线推迟到第二批（它要先动 ABI 才能表达 waterfall）。
-    /// 返回无效句柄 —— 调用方会把它当成「没注册上」，安全。
+    /// HostApi.on_event：注册监听，并**同时记账**（与 register_service 完全同构）。
+    ///
+    /// `user` 是注册者自己的数据指针，回调时作为第一个参数传回。
+    /// `host_ctx` 只用来认人（是哪个 fiber），不会传给监听器。
     pub fn apiOnEvent(
         host_ctx: *anyopaque,
         event: [*:0]const u8,
-        mode: abi.DispatchMode,
         cb: abi.Callback,
+        user: *anyopaque,
     ) callconv(.c) abi.Handle {
-        _ = host_ctx;
-        _ = event;
-        _ = mode;
-        _ = cb;
-        return abi.INVALID_HANDLE;
+        const slot = slotFrom(host_ctx);
+        const host = slot.host;
+
+        const h = host.bus.on(.{
+            .event = std.mem.span(event),
+            .cb = cb,
+            .user = user,
+            .owner = slot.fiber,
+        });
+        if (h.id == 0) return abi.INVALID_HANDLE;
+
+        const info = host.gpa.create(ListenerRevoke) catch {
+            // 记不上账就必须把刚注册的撤掉，否则留下一个永远不会被撤销的监听
+            host.bus.off(h.id, h.generation, slot.fiber);
+            return abi.INVALID_HANDLE;
+        };
+        info.* = .{ .bus = &host.bus, .owner = slot.fiber };
+
+        slot.fiber.addDisposable(.{
+            .id = h.id,
+            .generation = h.generation,
+            .run = revokeListener,
+            .data = @ptrCast(info),
+            .label = "listener",
+        }) catch {
+            host.gpa.destroy(info);
+            host.bus.off(h.id, h.generation, slot.fiber);
+            return abi.INVALID_HANDLE;
+        };
+
+        return h;
+    }
+
+    /// HostApi.emit：发布事件。事件名在 payload.name 里；
+    /// 怎么分发（emit / waterfall / bail）由**发布方**在这里指定。
+    pub fn apiEmit(
+        host_ctx: *anyopaque,
+        payload: *abi.EventPayload,
+        mode: abi.DispatchMode,
+    ) callconv(.c) abi.Status {
+        const slot = slotFrom(host_ctx);
+        return slot.host.bus.dispatch(std.mem.span(payload.name), payload, mode);
     }
 
     /// HostApi.revoke：插件主动提前撤销某一条注册（可选能力）。
@@ -441,6 +484,18 @@ pub const Context = struct {
 //  内部工具
 // ───────────────────────────────────────────────────────────────────────────
 
+/// 一条「撤销某个事件监听」所需的信息（与 ServiceRevoke 同构）。
+const ListenerRevoke = struct {
+    bus: *events.Bus,
+    owner: *fiber_mod.Fiber,
+};
+
+fn revokeListener(d: *fiber_mod.Disposable) void {
+    const info: *ListenerRevoke = @ptrCast(@alignCast(d.data));
+    info.bus.off(d.id, d.generation, info.owner);
+    info.bus.gpa.destroy(info);
+}
+
 /// 一条「撤销某个服务注册」所需的信息。
 /// 用**宿主分配器**分配，`revokeService` 里自己还回去 —— 撤销清单的生命周期
 /// 必须独立于插件 arena（arena 会在卸载时整块清空）。
@@ -469,6 +524,7 @@ fn buildApi(slot: *PluginSlot) abi.HostApi {
         .register_service = Context.apiRegisterService,
         .get_service = Context.apiGetService,
         .on_event = Context.apiOnEvent,
+        .emit = Context.apiEmit,
         .revoke = Context.apiRevoke,
     };
 }
@@ -570,20 +626,54 @@ test "apiLog: 带插件名前缀，不崩" {
     slot.api.log(slot.api.ctx, .err, "一个错误级别");
 }
 
-test "还没实现的能力诚实返回，不崩、不假装成功" {
+test "on_event: 注册与记账成对；发布能调到；卸载后监听清零" {
     const gpa = std.testing.allocator;
     var ctx = Context.init(gpa, std.testing.io);
     defer ctx.deinit();
 
-    const slot = try ctx.newFiber("stub", null);
-    const api = slot.api;
+    const slot = try ctx.newFiber("listener-test", null);
+    var hits: Hits = .{};
 
-    // 事件总线推迟到第二批（它得先改 ABI 才能表达 waterfall）。
-    // 返回无效句柄而不是空指针 —— 插件会把它当成「没注册上」，安全。
-    const ev = api.on_event(api.ctx, "tool/call", .emit, struct {
-        fn cb(_: *anyopaque, _: *const abi.EventPayload) callconv(.c) void {}
-    }.cb);
-    try std.testing.expectEqual(abi.INVALID_HANDLE.id, ev.id);
+    const h = slot.api.on_event(
+        slot.api.ctx,
+        "tool/pre-execute",
+        hitListener,
+        @ptrCast(&hits),
+    );
+    try std.testing.expect(h.id != 0);
+
+    // 两条账：总线里一条监听，fiber 的撤销清单里一条
+    try std.testing.expectEqual(@as(usize, 1), ctx.bus.count());
+    try std.testing.expectEqual(@as(usize, 1), ctx.bus.countFor("tool/pre-execute"));
+    try std.testing.expectEqual(@as(usize, 1), slot.fiber.disposers.items.len);
+
+    // 发布一次：监听器被调到（user 数据就是插件的状态指针）
+    var payload = abi.EventPayload{ .name = "tool/pre-execute", .json = "{}" };
+    try std.testing.expectEqual(abi.Status.ok, slot.api.emit(slot.api.ctx, &payload, .emit));
+    try std.testing.expectEqual(@as(usize, 1), hits.n);
+
+    // 卸载 -> 监听清零（监听器回调是插件里的函数地址，必须早于 dlclose 撤掉）
+    slot.fiber.unload();
+    try std.testing.expectEqual(@as(usize, 0), ctx.bus.count());
+    try std.testing.expectEqual(@as(usize, 0), slot.fiber.disposers.items.len);
+
+    // 再卸一次幂等
+    slot.fiber.unload();
+    try std.testing.expectEqual(@as(usize, 0), ctx.bus.count());
+}
+
+/// 测试用的监听器状态（user 数据）
+const Hits = struct { n: usize = 0 };
+
+fn hitListener(
+    user: *anyopaque,
+    payload: *abi.EventPayload,
+    next_ctx: *anyopaque,
+    next: abi.NextFn,
+) callconv(.c) abi.Status {
+    const hits: *Hits = @ptrCast(@alignCast(user));
+    hits.n += 1;
+    return next(next_ctx, payload);
 }
 
 test "register_service -> get_service：注册与取用，记账成对" {

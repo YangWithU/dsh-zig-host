@@ -36,9 +36,12 @@ const std = @import("std");
 ///
 /// 1 -> 2：HostApi 增加 read_file / write_file / run_shell 三个基础能力
 ///（把工具搬进 .so 需要它们），Status 增加 err_too_large / err_timeout。
+/// 2 -> 3：事件总线上线。Callback 的签名必须变 —— 旧签名没有放行把手、没有
+/// 返回值、payload 还是只读的，装不下 waterfall（环绕中间件）。同时 on_event
+/// 去掉了 mode 参数（改由发布方指定），HostApi 增加 emit。
 /// 旧插件会被 loader 拒绝加载 —— 这正是版本号存在的意义：
 /// 跨边界类型的布局一旦改变，调用不会报错，只会崩。
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// 跨边界统一返回码。**绝不跨边界抛 Zig error。**
 pub const Status = enum(c_int) {
@@ -55,6 +58,9 @@ pub const Status = enum(c_int) {
     err_too_large = 8,
     /// 超时（目前只有 run_shell 会返回它）。
     err_timeout = 9,
+    /// 监听器否决了这次事件（waterfall 里不调 next 就是否决）。
+    /// 与 err_internal 分开：这是监听器**有意的决定**，不是出了故障。
+    err_denied = 10,
 };
 
 /// 注册句柄。**id 由宿主分配，注册时返回给注册方。**
@@ -81,35 +87,83 @@ pub const LogLevel = enum(c_int) {
     err = 3,
 };
 
-/// 事件载荷：用一个 JSON 字符串充当通用载体。
+/// 事件载荷。
 ///
-/// 权衡说明：结构化（extern struct 逐字段声明）类型安全但每加一种事件就要改
-/// ABI；JSON 字符串弱类型但零 ABI 变更代价。草图阶段选后者，跑通后再针对
-/// 热点事件结构化。
+/// 用一个 JSON 字符串充当通用载体：结构化（逐事件声明 extern struct）类型安全，
+/// 但每加一种事件就要动 ABI；JSON 弱类型但零 ABI 代价。
+///
+/// `out_*` 是**供监听器写回结果**的缓冲区，由发布方提供（out_ptr 为 null 就是
+/// 本次分发不允许改写）。waterfall 的「改写」就写在这上面 —— 不新开一套「返回
+/// 值里带内存」的机制，与项目里 Buffer 的做法一致：谁调用谁提供内存。
 pub const EventPayload = extern struct {
-    /// 事件名，如 "tool/call"
+    /// 事件名，如 "tool/pre-execute"
     name: [*:0]const u8,
-    /// 事件数据（JSON 文本）
+    /// 事件数据（JSON 文本，只读输入）
     json: [*:0]const u8,
+
+    out_ptr: ?[*]u8 = null,
+    out_cap: usize = 0,
+    out_len: usize = 0,
+
+    pub fn out(self: *const EventPayload) []const u8 {
+        const p = self.out_ptr orelse return &.{};
+        return p[0..self.out_len];
+    }
+
+    /// 把结果写回输出缓冲（waterfall 的监听器改用它改写）
+    pub fn setOut(self: *EventPayload, data: []const u8) void {
+        const p = self.out_ptr orelse return;
+        const n = @min(data.len, self.out_cap);
+        @memcpy(p[0..n], data[0..n]);
+        self.out_len = n;
+    }
 };
+
+/// 环绕中间件的「放行」把手。
+///
+/// 监听器调它，把控制权交给链上的下一个监听器（全部走完后是「默认行为」，
+/// 也就是发布方预先写进 payload.out 的那份内容）。
+/// **不调它就是否决** —— 后面的监听器与默认行为都不执行。
+pub const NextFn = *const fn (next_ctx: *anyopaque, payload: *EventPayload) callconv(.c) Status;
 
 /// 事件监听回调。
 ///
-/// `host_ctx` 是宿主上下文句柄（插件原样回传，用来反查自己是哪个 fiber）。
-/// 注意：这是**函数指针**，一旦宿主卸载了插件代码而没撤销这个监听，
-/// 再触发就是段错误（实测过）。所以撤销必须在 dlclose 之前完成。
-pub const Callback = *const fn (host_ctx: *anyopaque, payload: *const EventPayload) callconv(.c) void;
-
-/// 事件分发模式（对应 Cordis 的 5 种）。
+/// ★ 所有分发方式共用这一个签名，区别只在**发布方**怎么用它：
+///     emit       忽略返回值（监听者只能观察）
+///     waterfall  用返回值与 payload.out（监听者能改写、能否决）
+///     bail       遇到第一个非 ok 的返回就停
 ///
-/// 草图里先把枚举位留出来；实现阶段建议**先只做 emit 和 waterfall**
-/// （事件的绝大多数用法），其余按需补。
+/// ★ payload 是**可变**指针：waterfall 里监听器要能改写它。
+///
+/// `user` 是注册时给的**用户数据指针**（C 里的 user data）。
+/// **不能省**：Zig 没有闭包，监听器要访问自己的状态只有靠它。
+/// `next_ctx`/`next` 是本轮分发的放行把手，对监听器不透明。
+///
+/// ⚠️ 这是函数指针：一旦宿主卸载了插件代码而没撤销这个监听，再触发就是段错误
+///    （实测过）。所以撤销必须在 dlclose 之前完成。
+pub const Callback = *const fn (
+    user: *anyopaque,
+    payload: *EventPayload,
+    next_ctx: *anyopaque,
+    next: NextFn,
+) callconv(.c) Status;
+
+/// 事件分发方式。**发布时指定**，不是注册时的属性 ——
+/// 同一个事件可以被不同方式分发，而监听器不需要知道自己会怎么被调用
+/// （Cordis 也是这个语义：ctx.emit / ctx.waterfall 是发布动作）。
+///
+/// 原草图里的 serial 去掉了：它是 JS 世界「bail 的异步版」，而 Zig 这边一切
+/// 都是同步的，两者没有区别。parallel 保留声明但**尚未实现**（agent 主循环是
+/// 串行的；要做得引入线程池）。
 pub const DispatchMode = enum(c_int) {
-    emit = 0, // 广播，不等待，无返回值
-    parallel = 1, // 全部并发，等待全部完成
-    bail = 2, // 按序，遇第一个非空返回值即停
-    serial = 3, // bail 的异步版
-    waterfall = 4, // 环绕中间件：监听器收到 next，不调 next 即否决
+    /// 广播：逐个调用全部监听器，忽略返回值 —— 通知（日志、统计、UI 刷新）
+    emit = 0,
+    /// 环绕中间件：监听器能改写 payload.out、能否决；发布方拿结果
+    waterfall = 1,
+    /// 按序问，遇到第一个非 ok 的返回即停 —— 竞争认领 / 多级判定
+    bail = 2,
+    /// 全部并发、等齐（未实现）
+    parallel = 3,
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -147,13 +201,27 @@ pub const RegisterServiceFn = *const fn (
 /// 消费者负责 cast 回具体类型：`const tools: *const ToolsIface = @ptrCast(@alignCast(p));`
 pub const GetServiceFn = *const fn (host_ctx: *anyopaque, name: [*:0]const u8, scope: u64) callconv(.c) ?*anyopaque;
 
-/// 注册事件监听。返回的 Handle 用于撤销。
+/// 注册事件监听。返回 Handle 供撤销。
+/// **不带分发方式** —— 那是发布方的事（见 DispatchMode 的说明）。
+///
+/// `user` 是调用方自己的数据指针，回调时原样传回第一个参数。
+/// 少了它就等于没有闭包可用（Zig 里监听器只是个函数指针）。
 pub const OnEventFn = *const fn (
     host_ctx: *anyopaque,
     event: [*:0]const u8,
-    mode: DispatchMode,
     cb: Callback,
+    user: *anyopaque,
 ) callconv(.c) Handle;
+
+/// 发布事件。
+///
+/// 事件名在 `payload.name` 里。payload 的输出缓冲由调用方准备：
+/// waterfall 的「默认行为」就是它预先写进去的那份内容，链上的监听器可以改写。
+pub const EmitFn = *const fn (
+    host_ctx: *anyopaque,
+    payload: *EventPayload,
+    mode: DispatchMode,
+) callconv(.c) Status;
 
 /// 撤销任意注册（服务 / 监听器 ……）。按 Handle.id 定位，不按名字。
 ///
@@ -269,6 +337,7 @@ pub const HostApi = extern struct {
     get_service: GetServiceFn,
 
     on_event: OnEventFn,
+    emit: EmitFn,
     revoke: RevokeFn,
 
     /// ABI 守卫。插件 init 的第一件事应该是检查它。
