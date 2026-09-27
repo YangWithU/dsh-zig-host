@@ -26,6 +26,7 @@
 const std = @import("std");
 const abi = @import("dsh_abi");
 const Context = @import("host/context.zig").Context;
+const hotreload = @import("host/hotreload.zig");
 const tool_api = @import("dsh_tools");
 const tools = @import("agent/tools.zig");
 const context_files = @import("agent/context_files.zig");
@@ -98,8 +99,8 @@ fn runAgent(
     defer ctx.deinit();
 
     const tools_path = "zig-out/lib/libtools.so";
-    switch (ctx.mountPlugin(tools_path, "{}")) {
-        .ok => {},
+    const tools_slot = switch (ctx.mountPlugin(tools_path, "{}")) {
+        .ok => |s| s,
         .failed => |st| {
             std.debug.print(
                 "无法加载工具插件 {s}（{s}）。先跑一次 zig build 把插件构建出来。\n",
@@ -107,7 +108,7 @@ fn runAgent(
             );
             return error.ToolsPluginUnavailable;
         },
-    }
+    };
 
     const tools_iface: *const tool_api.ToolsIface = @ptrCast(@alignCast(
         ctx.registry.get(tool_api.SERVICE_NAME, 0) orelse {
@@ -115,6 +116,28 @@ fn runAgent(
             return error.ToolsServiceMissing;
         },
     ));
+
+    // ── 热重载 ───────────────────────────────────────────────────────────
+    // 每次读输入前看一眼插件源码的**内容指纹**：变了就重编到新路径、拆旧装新。
+    // 所以「改一行源码 -> 回到终端按回车 -> 下一次工具调用就是新代码」。
+    // （阻塞在 stdin 时不会后台轮询；按回车就是在驱动它，这对 REPL 足够了。）
+    const reload_sources = [_][]const u8{
+        "src/plugins/tools.zig",
+        "src/tool_api.zig",
+        "src/abi.zig",
+    };
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+
+    var reload_arena = std.heap.ArenaAllocator.init(gpa);
+    defer reload_arena.deinit();
+
+    var spec = hotreload.PluginSpec{
+        .name = "tools",
+        .sources = &reload_sources,
+        .loaded_fingerprint = try hotreload.fingerprint(reload_arena.allocator(), io, cwd_abs, &reload_sources),
+        .current = tools_slot.fiber,
+    };
 
     // 会话日志：建不了就无日志继续跑 —— 记录是辅助，不该挡住对话
     const cwd = try std.process.currentPathAlloc(io, gpa);
@@ -155,9 +178,9 @@ fn runAgent(
     // 连这行提示都是从插件读的 —— 工具名字不在宿主代码里
     const tool_count = tools_iface.count(tools_iface.impl);
     for (0..tool_count) |i| {
-        const spec = tools_iface.at(tools_iface.impl, i) orelse continue;
+        const ts = tools_iface.at(tools_iface.impl, i) orelse continue;
         if (i > 0) std.debug.print(" / ", .{});
-        std.debug.print("{s}", .{std.mem.span(spec.name)});
+        std.debug.print("{s}", .{std.mem.span(ts.name)});
     }
     std.debug.print(
         \\
@@ -174,6 +197,43 @@ fn runAgent(
         const text = std.mem.trim(u8, line, " \t\r");
         if (text.len == 0) continue;
         if (std.mem.eql(u8, text, "exit") or std.mem.eql(u8, text, "quit")) break;
+
+        // 看一眼插件源码变了没有。重载成功后必须**重建 loop**：它持有旧的
+        // iface 指针（那块内存随旧 slot 一起销毁了），tools_json 也要按新表重算。
+        //
+        // ★ 位置是「读到输入之后、执行之前」，不是循环开头。放在开头的话，
+        //   检查完就阻塞在 stdin 上，源码在阻塞期间的变化要等到**下一次**输入
+        //   才被发现 —— 那就变成「改完代码按回车，仍然用旧代码跑一轮」，
+        //   正好反直觉。
+        _ = reload_arena.reset(.free_all);
+        const report = hotreload.reloadOnce(&ctx, &spec, io, reload_arena.allocator(), cwd_abs);
+        switch (report.outcome) {
+            .ok => {
+                std.debug.print("[hotreload] 工具插件已重新加载\n", .{});
+                const fresh_iface: *const tool_api.ToolsIface = @ptrCast(@alignCast(
+                    ctx.registry.get(tool_api.SERVICE_NAME, 0) orelse unreachable,
+                ));
+                // 先建新的、成功了再拆旧的：Loop.init 失败时旧的那个依然有效
+                const fresh = try loop_mod.Loop.init(
+                    gpa,
+                    arena,
+                    io,
+                    std.Io.Dir.cwd(),
+                    &client,
+                    &session,
+                    fresh_iface,
+                    if (log) |*l| l else null,
+                    .{},
+                );
+                lp.deinit();
+                lp = fresh;
+            },
+            .compile_failed, .load_failed => std.debug.print(
+                "[hotreload] 新代码没换上（{s}），继续用旧的。编译器说：\n{s}\n",
+                .{ @tagName(report.outcome), report.log },
+            ),
+            .unchanged, .skipped => {},
+        }
 
         // text 指向 reader 的内部缓冲区（下次读就失效），runTurn 会先拷走
         lp.runTurn(text) catch |e| std.debug.print("[错误] {s}\n", .{@errorName(e)});

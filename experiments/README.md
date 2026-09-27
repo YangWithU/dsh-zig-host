@@ -17,3 +17,4 @@
 | `build-cache/` | 「源码变了没」该用什么判据 | mtime 是假信号（touch 不触发重编）；zig 自己的缓存按内容判定，无改动时 37 ms 命中 |
 | `zig-016-api/` | Zig 0.16 的 HTTPS、文件、子进程、JSON 能否直接用 | 全部可用，但 API 与 0.11–0.15 的教程完全不同，详见各文件头 |
 | `arena-alloc/` | ArenaAllocator 的 alloc 四级回退各自何时触发；对齐填充与 free 的真实语义 | 单线程下 free_list 恒空（第 3 级是多线程抢挂失败后的回收站）；bump 失败会把 end_index 永久顶高、可超过 buf_len；free 只对 head chunk 的最后一次分配生效 |
+| `plugin-hotreload/` | 改插件源码能否让**正在运行的**宿主换上新实现 | 能。同一进程里两次 bash 工具结果分别是 `[exit 0]` 与 `[EXIT 0]`（中间改了源码）。两个前提：重载检查要在**读到输入之后**做（放在读之前会阻塞在 stdin 上，改成等下一轮才生效）；产物必须落到新路径（覆盖已加载的 .so 会段错误）。复现：`bash experiments/plugin-hotreload/run.sh` |

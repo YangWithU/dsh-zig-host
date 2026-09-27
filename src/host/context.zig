@@ -136,6 +136,14 @@ pub const Context = struct {
 
     // ── 宿主侧的挂载 / 卸载入口 ─────────────────────────────────────────────
 
+    /// 按 fiber 找回它的 slot。热重载要用：拆旧之前得知道拆的是哪一个。
+    pub fn slotOfFiber(self: *Context, f: *fiber_mod.Fiber) ?*PluginSlot {
+        for (self.slots.items) |s| {
+            if (s.fiber == f) return s;
+        }
+        return null;
+    }
+
     pub const MountResult = union(enum) {
         ok: *PluginSlot,
         /// 加载失败。fiber 已经在 load 内部完整回滚过，也已经从表里摘掉，

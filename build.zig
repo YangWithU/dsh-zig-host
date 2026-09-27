@@ -103,6 +103,16 @@ pub fn build(b: *std.Build) void {
             .root_module = pmod,
         });
         b.installArtifact(lib);
+
+        // 单独构建并安装某一个插件。热重载用它：
+        //   · 只编译目标插件，不碰宿主
+        //   · 配合 `--prefix <每代一个目录>`，产物不会覆盖任何已加载的文件
+        //     （覆盖正在被 dlopen 的 .so 会直接段错误，已实测）
+        const only_this = b.step(
+            b.fmt("plugin-{s}", .{name}),
+            b.fmt("只构建并安装 {s} 插件（热重载用）", .{name}),
+        );
+        only_this.dependOn(&b.addInstallArtifact(lib, .{}).step);
     }
 
     // ───────────────────────────────────────────────────────────────────────

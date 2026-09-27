@@ -8,5 +8,6 @@ test {
     _ = @import("loader.zig");
     _ = @import("fiber.zig");
     _ = @import("context.zig");
+    _ = @import("hotreload.zig");
     _ = @import("plugin_loading_test.zig");
 }
