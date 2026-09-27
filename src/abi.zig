@@ -401,4 +401,15 @@ pub const EventNames = struct {
     /// 请求即将发出（waterfall）。监听器往 payload.out 写「额外要注入的上下文」，
     /// 宿主把它拼进这一轮的 system 消息（不写进会话历史）。
     pub const agent_request = "agent/request";
+
+    /// 模型说了一段话（emit）。文本为空时不发 —— 否则界面上一堆空行。
+    /// 终端渲染层靠它显示「助手说了什么」。
+    pub const assistant_text = "assistant-text";
+
+    /// 一次工具调用结束（emit）：payload 是 {"tool":…,"ok":…,"bytes":…}。
+    /// 与 tool_call 配对，一前一后。
+    pub const tool_result = "tool/result";
+
+    /// 状态变化（emit）：payload 是 {"state":"thinking"|"idle"}。
+    pub const agent_status = "agent/status";
 };

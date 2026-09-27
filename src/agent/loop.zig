@@ -143,9 +143,15 @@ pub const Loop = struct {
                 injected = p.out();
             }
 
+            // 状态：开始想
+            self.emitStatus(ta, "thinking");
+
             const done = try self.client.complete(ta, self.session, self.tools_json, injected);
 
-            if (done.text.len > 0) std.debug.print("{s}\n", .{done.text});
+            // 模型说了什么 —— 交给渲染层显示（loop 自己不再往终端写）
+            if (done.text.len > 0) {
+                self.emitEvent(abi.EventNames.assistant_text, try textJson(ta, done.text));
+            }
 
             // assistant 这一轮同样要进历史，且 tool_calls 必须原样保留
             try self.record(.{
@@ -154,7 +160,10 @@ pub const Loop = struct {
                 .tool_calls = try self.keepToolCalls(done.tool_calls),
             }, done.prompt_tokens, done.completion_tokens);
 
-            if (!done.wantsTools()) return;
+            if (!done.wantsTools()) {
+                self.emitStatus(ta, "idle");
+                return;
+            }
 
             for (done.tool_calls) |call| {
                 const result = try self.runTool(ta, call);
@@ -167,6 +176,7 @@ pub const Loop = struct {
         }
 
         std.debug.print("[loop] 已达 {d} 轮上限，停止本轮（防模型反复调工具）\n", .{self.cfg.max_rounds});
+        self.emitStatus(self.session_arena, "idle");
     }
 
     /// 追加一条消息：进内存历史 + 落日志。所有消息都走这里，不会有只落一边的路径。
@@ -242,15 +252,29 @@ pub const Loop = struct {
         }
 
         const text = out.slice();
-        if (status != .ok) {
-            // 失败时把内容也打出来，不然只能看到一个状态码（排查时很痛苦）
-            std.debug.print("[tool] {s} -> {s}: {s}\n", .{ call.name, @tagName(status), text });
-        } else {
-            std.debug.print("[tool] {s} -> ok（{d} 字节）\n", .{ call.name, text.len });
-        }
+
+        // 结果事件：与 tool/call 配对（loop 自己不再往终端写，显示归渲染层）
+        self.emitEvent(
+            abi.EventNames.tool_result,
+            try toolResultJson(ta, call.name, status == .ok, text.len),
+        );
 
         // 结果要活到会话结束（下一轮请求还要用它），必须拷出来
         return self.session_arena.dupe(u8, text);
+    }
+
+    /// 发一个 emit 类事件。没有注入派发器时什么都不做 —— 事件是观察通道，
+    /// 不该成为 loop 的前提条件。
+    fn emitEvent(self: *Loop, event: [:0]const u8, json: [:0]const u8) void {
+        const d = self.dispatcher orelse return;
+        var p = abi.EventPayload{ .name = event.ptr, .json = json.ptr };
+        _ = d.call(d.ctx, &p, .emit);
+    }
+
+    /// 状态事件。失败就当我没发（事件是观察通道，不该影响主流程）。
+    fn emitStatus(self: *Loop, arena: std.mem.Allocator, state: []const u8) void {
+        const json = statusJson(arena, state) catch return;
+        self.emitEvent(abi.EventNames.agent_status, json);
     }
 
     /// 把一次工具调用编成事件载荷 JSON。
@@ -265,6 +289,53 @@ fn toolCallJson(arena: std.mem.Allocator, call: llm.ToolCall) ![:0]const u8 {
     try std.json.Stringify.value(call.name, .{}, w);
     try w.writeAll(",\"arguments\":");
     try std.json.Stringify.value(call.arguments_json, .{}, w);
+    try w.writeAll("}");
+    try w.writeByte(0);
+
+    const all = aw.written();
+    return all[0 .. all.len - 1 : 0];
+}
+
+/// 工具结果事件：{"tool":…,"ok":…,"bytes":…}
+fn toolResultJson(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    ok: bool,
+    bytes: usize,
+) ![:0]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+
+    try w.writeAll("{\"tool\":");
+    try std.json.Stringify.value(name, .{}, w);
+    try w.print(",\"ok\":{s},\"bytes\":{d}}}", .{ if (ok) "true" else "false", bytes });
+    try w.writeByte(0);
+
+    const all = aw.written();
+    return all[0 .. all.len - 1 : 0];
+}
+
+/// 助手文本事件：{"text":"…"}
+fn textJson(arena: std.mem.Allocator, text: []const u8) ![:0]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+
+    try w.writeAll("{\"text\":");
+    try std.json.Stringify.value(text, .{}, w);
+    try w.writeAll("}");
+    try w.writeByte(0);
+
+    const all = aw.written();
+    return all[0 .. all.len - 1 : 0];
+}
+
+/// 状态事件：{"state":"…"}
+fn statusJson(arena: std.mem.Allocator, state: []const u8) ![:0]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+
+    try w.writeAll("{\"state\":");
+    try std.json.Stringify.value(state, .{}, w);
     try w.writeAll("}");
     try w.writeByte(0);
 
@@ -476,7 +547,7 @@ test "runTurn: 模型反复调工具时会在轮次上限停下来" {
 /// 测试用的派发器：记录收到的事件，可选地否决工具或注入上下文。
 /// 它就是插件里那个监听器在宿主侧的等价形状 —— 同一套 ABI 签名。
 const TestDispatcher = struct {
-    seen: [8][]const u8 = undefined,
+    seen: [16][]const u8 = undefined,
     n: usize = 0,
     /// true = 否决一切工具执行
     deny_tools: bool = false,
@@ -515,7 +586,23 @@ const TestDispatcher = struct {
     }
 };
 
-test "接入事件总线：每轮发 agent/request，每次工具调用发 tool/call 与 tool/pre-execute" {
+/// 某个事件第一次出现的下标（找不到 = null）
+fn firstIndexOf(d: *const TestDispatcher, name: []const u8) ?usize {
+    for (d.seen[0..d.n], 0..) |s, i| {
+        if (std.mem.eql(u8, s, name)) return i;
+    }
+    return null;
+}
+
+fn countOf(d: *const TestDispatcher, name: []const u8) usize {
+    var n: usize = 0;
+    for (d.seen[0..d.n]) |s| {
+        if (std.mem.eql(u8, s, name)) n += 1;
+    }
+    return n;
+}
+
+test "接入事件总线：每轮发 agent/request，每次工具调用发 tool/call -> pre-execute -> result" {
     var replay = llm.ReplayTransport{ .responses = &.{ round_with_tool_call, round_final }, .gpa = std.testing.allocator };
     defer replay.deinit();
     var env: TestEnv = undefined;
@@ -527,12 +614,21 @@ test "接入事件总线：每轮发 agent/request，每次工具调用发 tool/
 
     try env.loop.runTurn("帮我 echo 一下");
 
-    // 顺序：第一轮请求前 -> 工具广播 -> 工具执行前 -> 第二轮请求前
-    try std.testing.expectEqual(@as(usize, 4), disp.n);
-    try std.testing.expectEqualStrings(abi.EventNames.agent_request, disp.seen[0]);
-    try std.testing.expectEqualStrings(abi.EventNames.tool_call, disp.seen[1]);
-    try std.testing.expectEqualStrings(abi.EventNames.tool_pre_execute, disp.seen[2]);
-    try std.testing.expectEqualStrings(abi.EventNames.agent_request, disp.seen[3]);
+    // 断言的是**局部顺序**而不是完整序列：以后再加事件时这条测试不会碎，
+    // 而它要保护的东西（三个接入点的先后关系）一个不漏。
+    const i_req = firstIndexOf(&disp, abi.EventNames.agent_request).?;
+    const i_call = firstIndexOf(&disp, abi.EventNames.tool_call).?;
+    const i_pre = firstIndexOf(&disp, abi.EventNames.tool_pre_execute).?;
+    const i_res = firstIndexOf(&disp, abi.EventNames.tool_result).?;
+    try std.testing.expect(i_req < i_call); // 先发请求才轮到工具
+    try std.testing.expect(i_call < i_pre); // 广播在外，包裹在内
+    try std.testing.expect(i_pre < i_res); // 结果在调用之后
+
+    // 两轮请求 -> 两次 agent/request；一条文本 -> 一次 assistant-text；
+    // 状态：thinking(轮1) / thinking(轮2) / idle(收尾) = 3 次
+    try std.testing.expectEqual(@as(usize, 2), countOf(&disp, abi.EventNames.agent_request));
+    try std.testing.expectEqual(@as(usize, 1), countOf(&disp, abi.EventNames.assistant_text));
+    try std.testing.expectEqual(@as(usize, 3), countOf(&disp, abi.EventNames.agent_status));
 
     // 链尾默认行为真的执行了工具
     const msgs = env.session.messages.items;

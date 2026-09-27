@@ -32,6 +32,7 @@ const tools = @import("agent/tools.zig");
 const context_files = @import("agent/context_files.zig");
 const llm = @import("agent/llm.zig");
 const loop_mod = @import("agent/loop.zig");
+const render = @import("agent/render.zig");
 const session_log = @import("agent/session_log.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -127,6 +128,26 @@ fn runAgent(
             "[warn] hello 观察者插件没挂上（{s}），事件观察点缺席\n",
             .{@tagName(st)},
         ),
+    }
+
+    // 终端渲染层：订阅事件，把「谁说了什么、工具在干什么」显示出来。
+    //
+    // 它是宿主自己的东西，所以 owner = null（没有归属的 fiber，不需要单独撤销，
+    // 活到进程结束）。放在这里而不是插件里：一个终端只有一个写者，而插件是
+    // 可热重载的陌生代码 —— 详见 src/agent/render.zig 文件头。
+    var renderer = render.Renderer{};
+    for ([_][]const u8{
+        abi.EventNames.assistant_text,
+        abi.EventNames.tool_call,
+        abi.EventNames.tool_result,
+        abi.EventNames.agent_status,
+    }) |ev| {
+        _ = ctx.bus.on(.{
+            .event = ev,
+            .cb = render.onEvent,
+            .user = @ptrCast(&renderer),
+            .owner = null,
+        });
     }
 
     // ── 热重载 ───────────────────────────────────────────────────────────

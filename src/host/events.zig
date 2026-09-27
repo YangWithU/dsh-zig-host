@@ -57,8 +57,10 @@ pub const Listener = struct {
     /// 回调第一个参数原样传回的**用户数据**（注册者自己的状态指针）。
     /// Zig 没有闭包，监听器要访问自己的状态只有靠这个。
     user: *anyopaque,
-    /// 谁注册的 —— 撤销时校验「这条确实是你的」
-    owner: *fiber_mod.Fiber,
+    /// 谁注册的 —— 撤销时校验「这条确实是你的」。
+    /// **可空**：宿主自己注册的监听（比如终端渲染层）没有归属的 fiber，
+    /// 它们活到 Context 释放为止，不需要单独撤销。
+    owner: ?*fiber_mod.Fiber,
     generation: u32 = 1,
 };
 
@@ -105,7 +107,7 @@ pub const Bus = struct {
     /// 撤销监听（由 fiber 的撤销清单在卸载时调用，插件也可主动调）。
     /// 按 (id, generation, owner) 定位；对不上说明早已撤过或本来就不属于你 ——
     /// 静默返回，幂等，不动别人家的行。
-    pub fn off(self: *Bus, id: u64, generation: u32, owner: *fiber_mod.Fiber) void {
+    pub fn off(self: *Bus, id: u64, generation: u32, owner: ?*fiber_mod.Fiber) void {
         if (self.depth > 0) return;
 
         for (self.listeners.items, 0..) |l, i| {

@@ -71,11 +71,9 @@ fn onPing(user: *anyopaque, payload: *abi.EventPayload, next_ctx: *anyopaque, ne
 fn onToolPre(user: *anyopaque, payload: *abi.EventPayload, next_ctx: *anyopaque, next: abi.NextFn) callconv(.c) abi.Status {
     _ = user;
     if (saved_api) |api| {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "工具即将执行：{s}", .{
-            std.mem.span(payload.json),
-        }) catch "工具即将执行";
-        api.log(api.ctx, .info, msg.ptr);
+        // 只打一句固定的话：这个监听器的职责是证明「事件确实到了插件里」，
+        // 而不是把载荷再打印一遍（那会与宿主渲染层的 [工具] 行重复）。
+        api.log(api.ctx, .info, "收到 tool/pre-execute（已放行）");
     }
     return next(next_ctx, payload);
 }
