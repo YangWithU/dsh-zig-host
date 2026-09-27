@@ -23,7 +23,7 @@ const session_log = @import("session_log.zig");
 
 pub const Config = struct {
     /// 单次输入最多允许几轮「请求 + 工具」往返
-    max_rounds: u32 = 16,
+    max_rounds: u32 = 32,
     /// 单个工具结果缓冲区的字节数
     tool_output_bytes: usize = 64 * 1024,
 };
