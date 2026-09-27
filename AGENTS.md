@@ -67,6 +67,21 @@ zig build run    # 运行宿主
 
 ## 当前进度
 
-- 已完成：五阶段骨架（函数体为 TODO 的空壳）、工具四件套、AGENTS.md 注入
-- 进行中：MVP（agent 请求 + 主循环 + REPL）；插件机制（阶段 1–4）暂不接入
-- 下一步：`src/agent/llm.zig` 与 `src/agent/loop.zig` 的实现
+**MVP（agent 侧）已完成**：工具四件套 + AGENTS.md 注入 + LLM 客户端（可替换
+传输层）+ 主循环 + REPL + 会话持久化（jsonl）。`dsh_zig` 能对话、能调工具，
+端到端跑通过真 DeepSeek。
+
+**插件内核（host 侧）进行中**，已完成：
+- `services.zig` 服务表（provide / revoke / get，编号不复用、名字拷贝、拒重名）
+- `loader.zig` dlopen + 先校验 ABI 版本再取符号
+- `fiber.zig` 状态机 + 专属 arena + 撤销清单（卸载三步顺序写死在注释里）
+- `context.zig` 装配层：per-plugin 包装 + 6 个 HostApi 函数 + mountPlugin/unmountPlugin
+- `plugins/hello.zig` 真插件
+- 装卸闭环已有集成测试：真 dlopen -> 注册 -> 卸载 -> 零残留，反复 15 次无泄漏
+
+**下一步**：工具插件搬家（`agent/tools.zig` 的四件套搬进 `.so`，届时 ABI 加
+read_file / write_file / run_shell，ABI_VERSION 1 -> 2），然后阶段 4 热重载。
+
+**刻意推迟**（都有理由，别提前做）：事件总线（`events.zig`，工具插件用不到它，
+且它要支持 waterfall 就必须先改 ABI 的回调签名）；依赖门（inject/epoch）；
+隔离作用域；流式输出与 TUI（记在 todo 里）。
