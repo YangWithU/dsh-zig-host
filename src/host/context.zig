@@ -38,8 +38,8 @@
 //! 当前实现进度（一步一步来，每一步都留可验证的测试）
 //! ---------------------------------------------------------------------------
 //!   已完成: init / deinit / newFiber / apiAlloc / apiLog
-//!   下一步: apiRegisterService / apiGetService / apiRevoke（服务注册闭环）
-//!   再下一步: mountPlugin / unmountPlugin（真 dlopen 一个 .so）
+//!          apiRegisterService / apiGetService / apiRevoke（服务注册闭环）
+//!   下一步: mountPlugin / unmountPlugin（真 dlopen 一个 .so）
 //!   推迟:   apiOnEvent（事件总线第二批）、依赖门（settle）、隔离作用域
 
 const std = @import("std");
@@ -163,9 +163,17 @@ pub const Context = struct {
         });
     }
 
-    /// HostApi.register_service：**下一步实现**。
-    /// 现在诚实返回「无效句柄」，而不是假装成功 —— 假装成功会让插件以为
-    /// 自己注册上了，实际什么都没有。
+    /// HostApi.register_service：把调用者的能力放上桌，并**同时记账**。
+    ///
+    /// 三步，顺序固定：
+    ///   ① registry.provide        —— 分配编号、入表、记 owner
+    ///   ② 用宿主分配器造一条撤销项（存编号与代次，不存名字）追加到
+    ///      **调用者这个 fiber** 的撤销清单里
+    ///   ③ 返回 Handle 给插件
+    ///
+    /// 「注册」与「登记撤销」必须成对且先注册后记账：漏一个就是卸载后段错误；
+    /// 顺序反了则可能留下一条指向不存在注册的脏账（provide 因重名失败时）。
+    /// 任何一步失败都要把前面已做的撤掉 —— 不留半个注册。
     pub fn apiRegisterService(
         host_ctx: *anyopaque,
         name: [*:0]const u8,
@@ -173,24 +181,57 @@ pub const Context = struct {
         impl: *anyopaque,
         scope: u64,
     ) callconv(.c) abi.Handle {
-        _ = host_ctx;
-        _ = name;
-        _ = iface;
-        _ = impl;
-        _ = scope;
-        return abi.INVALID_HANDLE;
+        const slot = slotFrom(host_ctx);
+        const host = slot.host;
+
+        // ① 入表（重名或分配失败 -> 无效句柄）
+        const h = host.registry.provide(.{
+            .name = std.mem.span(name),
+            .scope = scope,
+            .iface = iface,
+            .impl = impl,
+            .owner = slot.fiber,
+        });
+        if (h.id == 0) return abi.INVALID_HANDLE;
+
+        // ②a 造撤销项的上下文（宿主分配器，**不走插件 arena**）
+        const info = host.gpa.create(ServiceRevoke) catch {
+            // 连账都记不上，就必须把刚注册的撤掉：
+            // 否则表里留着一个永远不会被撤销的注册（卸载后就是野指针）。
+            host.registry.revoke(h.id, h.generation, slot.fiber);
+            return abi.INVALID_HANDLE;
+        };
+        info.* = .{ .registry = &host.registry, .owner = slot.fiber };
+
+        // ②b 记账
+        slot.fiber.addDisposable(.{
+            .id = h.id,
+            .generation = h.generation,
+            .run = revokeService,
+            .data = @ptrCast(info),
+            // 标签不拼上服务名：那个字符串来自插件，生命周期不归我们管，
+            // 而标签要留到卸载时用。诊断时按 id 去表里查即可。
+            .label = "service",
+        }) catch {
+            host.gpa.destroy(info);
+            host.registry.revoke(h.id, h.generation, slot.fiber);
+            return abi.INVALID_HANDLE;
+        };
+
+        return h;
     }
 
-    /// HostApi.get_service：**下一步实现**。
+    /// HostApi.get_service：这就是 Cordis `ctx.tools` 的对应物。
+    /// 没有这个服务 -> 返回 null（**不是错误**：依赖未就绪是合法状态）。
     pub fn apiGetService(
         host_ctx: *anyopaque,
         name: [*:0]const u8,
         scope: u64,
     ) callconv(.c) ?*anyopaque {
-        _ = host_ctx;
-        _ = name;
-        _ = scope;
-        return null;
+        const slot = slotFrom(host_ctx);
+        const iface = slot.host.registry.get(std.mem.span(name), scope) orelse return null;
+        // 返回接口表本身；调用方自己 cast 成具体的 iface 类型
+        return @constCast(iface);
     }
 
     /// HostApi.on_event：事件总线推迟到第二批（它要先动 ABI 才能表达 waterfall）。
@@ -208,17 +249,48 @@ pub const Context = struct {
         return abi.INVALID_HANDLE;
     }
 
-    /// HostApi.revoke（插件主动提前撤销）：**下一步实现**。
+    /// HostApi.revoke：插件主动提前撤销某一条注册（可选能力）。
+    ///
+    /// 在本 fiber 的撤销清单里按 (id, generation) 找到那一条 -> 执行它
+    /// （去宿主表里删行）-> 从清单里移除。
+    ///
+    /// ★ 这不是「卸载」：卸载是宿主对整份清单的批量执行；这里只是把其中
+    ///   一条提前执行。两者共用同一份撤销项，所以两条路径不会打架。
     pub fn apiRevoke(host_ctx: *anyopaque, h: abi.Handle) callconv(.c) abi.Status {
-        _ = host_ctx;
-        _ = h;
-        return .err_internal;
+        const slot = slotFrom(host_ctx);
+        const f = slot.fiber;
+
+        for (f.disposers.items, 0..) |*d, i| {
+            // id 撞上但代次不同 = 「重新注册后的新一代」，不是你要撤的那条
+            if (d.id != h.id or d.generation != h.generation) continue;
+            d.run(d);
+            _ = f.disposers.orderedRemove(i);
+            return .ok;
+        }
+
+        // 找不到 = 早就撤过了（幂等，不崩）
+        return .err_not_found;
     }
 };
 
 // ───────────────────────────────────────────────────────────────────────────
 //  内部工具
 // ───────────────────────────────────────────────────────────────────────────
+
+/// 一条「撤销某个服务注册」所需的信息。
+/// 用**宿主分配器**分配，`revokeService` 里自己还回去 —— 撤销清单的生命周期
+/// 必须独立于插件 arena（arena 会在卸载时整块清空）。
+const ServiceRevoke = struct {
+    registry: *services.Registry,
+    owner: *fiber_mod.Fiber,
+};
+
+fn revokeService(d: *fiber_mod.Disposable) void {
+    const info: *ServiceRevoke = @ptrCast(@alignCast(d.data));
+    info.registry.revoke(d.id, d.generation, info.owner);
+    // 谁分配谁释放：这条撤销项的上下文用完就还
+    info.registry.gpa.destroy(info);
+}
 
 /// 构造某个 slot 专属的 HostApi：函数指针全同，只有 ctx 指向自己。
 fn buildApi(slot: *PluginSlot) abi.HostApi {
@@ -312,22 +384,143 @@ test "还没实现的能力诚实返回，不崩、不假装成功" {
     const slot = try ctx.newFiber("stub", null);
     const api = slot.api;
 
-    // 注册：返回无效句柄（而不是假装成功）—— 插件会看到 id == 0
-    const h = api.register_service(api.ctx, "something", @ptrCast(slot), @ptrCast(slot), 0);
-    try std.testing.expectEqual(abi.INVALID_HANDLE.id, h.id);
-    try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
-
-    // 查服务：没有就是 null（不是错误）
-    try std.testing.expect(api.get_service(api.ctx, "something", 0) == null);
-
-    // 事件总线推迟：同样是无效句柄
+    // 事件总线推迟到第二批（它得先改 ABI 才能表达 waterfall）。
+    // 返回无效句柄而不是空指针 —— 插件会把它当成「没注册上」，安全。
     const ev = api.on_event(api.ctx, "tool/call", .emit, struct {
         fn cb(_: *anyopaque, _: *const abi.EventPayload) callconv(.c) void {}
     }.cb);
     try std.testing.expectEqual(abi.INVALID_HANDLE.id, ev.id);
+}
 
-    // 主动撤销：明确失败，不静默
-    try std.testing.expectEqual(abi.Status.err_internal, api.revoke(api.ctx, .{ .id = 1 }));
+test "register_service -> get_service：注册与取用，记账成对" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const provider = try ctx.newFiber("provider", null);
+    const consumer = try ctx.newFiber("consumer", null);
+    var iface_blob: u32 = 1;
+    var impl_blob: u32 = 2;
+
+    const h = provider.api.register_service(
+        provider.api.ctx,
+        "greeter",
+        @ptrCast(&iface_blob),
+        @ptrCast(&impl_blob),
+        0,
+    );
+    try std.testing.expect(h.id != 0);
+
+    // 表里一行，owner 记的是提供者
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.count());
+    const entry = ctx.registry.lookup(h.id).?;
+    try std.testing.expectEqualStrings("greeter", entry.name);
+    try std.testing.expect(entry.owner == provider.fiber);
+    try std.testing.expect(entry.iface == @as(*const anyopaque, @ptrCast(&iface_blob)));
+
+    // 记账成对：清单里恰好一条，id 与代次都对得上
+    try std.testing.expectEqual(@as(usize, 1), provider.fiber.disposers.items.len);
+    try std.testing.expectEqual(h.id, provider.fiber.disposers.items[0].id);
+    try std.testing.expectEqual(h.generation, provider.fiber.disposers.items[0].generation);
+
+    // 另一个插件按名字就能取到手
+    const got = consumer.api.get_service(consumer.api.ctx, "greeter", 0);
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.? == @as(*anyopaque, @ptrCast(&iface_blob)));
+
+    // 别的 scope 没这份；不存在的名字是 null（不是错误）
+    try std.testing.expect(consumer.api.get_service(consumer.api.ctx, "greeter", 5) == null);
+    try std.testing.expect(consumer.api.get_service(consumer.api.ctx, "nope", 0) == null);
+}
+
+test "拒重名；卸载后表与清单双双清零（零残留）" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const slot = try ctx.newFiber("plug", null);
+    var blob: u32 = 1;
+
+    const h1 = slot.api.register_service(slot.api.ctx, "tools", @ptrCast(&blob), @ptrCast(&blob), 0);
+    try std.testing.expect(h1.id != 0);
+
+    // 同名同 scope -> 拒，且**不留下脏账**
+    const dup = slot.api.register_service(slot.api.ctx, "tools", @ptrCast(&blob), @ptrCast(&blob), 0);
+    try std.testing.expectEqual(abi.INVALID_HANDLE.id, dup.id);
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.count());
+    try std.testing.expectEqual(@as(usize, 1), slot.fiber.disposers.items.len);
+
+    // 同名不同 scope -> 允许共存
+    const h3 = slot.api.register_service(slot.api.ctx, "tools", @ptrCast(&blob), @ptrCast(&blob), 7);
+    try std.testing.expect(h3.id != 0);
+    try std.testing.expectEqual(@as(usize, 2), ctx.registry.count());
+    try std.testing.expectEqual(@as(usize, 2), slot.fiber.disposers.items.len);
+
+    // ★ 这一条就是阶段 1 的验收命题：挂载 -> 注册 N 项 -> 卸载 -> 零残留
+    slot.fiber.unload();
+    try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
+    try std.testing.expectEqual(@as(usize, 0), slot.fiber.disposers.items.len);
+
+    // 再卸一次幂等
+    slot.fiber.unload();
+    try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
+}
+
+test "apiRevoke：插件提前撤掉单条，幂等且不动别人的" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const slot = try ctx.newFiber("plug", null);
+    var blob: u32 = 1;
+
+    const h1 = slot.api.register_service(slot.api.ctx, "a", @ptrCast(&blob), @ptrCast(&blob), 0);
+    const h2 = slot.api.register_service(slot.api.ctx, "b", @ptrCast(&blob), @ptrCast(&blob), 0);
+    try std.testing.expectEqual(@as(usize, 2), ctx.registry.count());
+
+    // 提前撤掉 a
+    try std.testing.expectEqual(abi.Status.ok, slot.api.revoke(slot.api.ctx, h1));
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.count());
+    try std.testing.expectEqual(@as(usize, 1), slot.fiber.disposers.items.len);
+    // 撤的是 a 不是 b
+    try std.testing.expect(ctx.registry.get("a", 0) == null);
+    try std.testing.expect(ctx.registry.get("b", 0) != null);
+
+    // 再撤一次：清单里已经没有这条了
+    try std.testing.expectEqual(abi.Status.err_not_found, slot.api.revoke(slot.api.ctx, h1));
+    // 代次对不上也不撤
+    try std.testing.expectEqual(
+        abi.Status.err_not_found,
+        slot.api.revoke(slot.api.ctx, .{ .id = h2.id, .generation = h2.generation + 1 }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.count());
+
+    // 剩下的那条仍然能被卸载流程收走
+    slot.fiber.unload();
+    try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
+    try std.testing.expectEqual(@as(usize, 0), slot.fiber.disposers.items.len);
+}
+
+test "卸载一个插件不会动另一个插件的注册" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const a = try ctx.newFiber("a", null);
+    const b = try ctx.newFiber("b", null);
+    var blob: u32 = 1;
+
+    _ = a.api.register_service(a.api.ctx, "fs", @ptrCast(&blob), @ptrCast(&blob), 0);
+    _ = b.api.register_service(b.api.ctx, "net", @ptrCast(&blob), @ptrCast(&blob), 0);
+    try std.testing.expectEqual(@as(usize, 2), ctx.registry.count());
+
+    a.fiber.unload();
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.count());
+    // b 的还在，a 的没了
+    try std.testing.expect(b.api.get_service(b.api.ctx, "net", 0) != null);
+    try std.testing.expect(ctx.registry.get("fs", 0) == null);
+    // b 的账也没被动
+    try std.testing.expectEqual(@as(usize, 1), b.fiber.disposers.items.len);
 }
 
 test "deinit: 卸掉所有 fiber 且无泄漏（testing.allocator 会报告）" {

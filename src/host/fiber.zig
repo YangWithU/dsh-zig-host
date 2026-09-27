@@ -69,6 +69,11 @@ pub const Disposable = struct {
     ///   插件主动撤销（api.revoke）时，就是靠它在清单里找到这一条。
     id: u64 = 0,
 
+    /// 该注册被提供时的代次（等于 Handle.generation）。
+    /// 撤销时一并校验：id 撞上但代次不同 = 这是「重新注册后的新一代」，
+    /// 不是你要撤的那一条（ABA）。插件手里那个旧 handle 会因此失效。
+    generation: u32 = 0,
+
     /// 真正执行撤销的函数。
     run: *const fn (self: *Disposable) void,
 
