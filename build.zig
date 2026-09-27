@@ -35,6 +35,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // 示例服务接口：宿主与用它的插件共享同一份类型定义。
+    // 单独成模块，而不是塑进 dsh_abi —— dsh_abi 只放每个插件都要用的通用
+    // 契约（Handle / Status / HostApi），具体服务的接口布局各自成模块，
+    // 这样加一个新服务不需要动 ABI。
+    const greeter_mod = b.addModule("dsh_greeter", .{
+        .root_source_file = b.path("src/example/greeter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ───────────────────────────────────────────────────────────────────────
     //  宿主可执行文件
     // ───────────────────────────────────────────────────────────────────────
@@ -70,6 +80,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "dsh_abi", .module = abi_mod },
+                .{ .name = "dsh_greeter", .module = greeter_mod },
             },
         });
         pmod.link_libc = true;
@@ -125,8 +136,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "dsh_abi", .module = abi_mod },
+            .{ .name = "dsh_greeter", .module = greeter_mod },
         },
     });
     host_test_mod.link_libc = true;
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = host_test_mod })).step);
+    const host_tests = b.addRunArtifact(b.addTest(.{ .root_module = host_test_mod }));
+    // 集成测试要 dlopen zig-out/lib/libhello.so，所以先把插件构建出来。
+    // （顺序有保证：install 先跑完，测试才启动。）
+    host_tests.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&host_tests.step);
 }

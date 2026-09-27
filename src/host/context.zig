@@ -39,13 +39,22 @@
 //! ---------------------------------------------------------------------------
 //!   已完成: init / deinit / newFiber / apiAlloc / apiLog
 //!          apiRegisterService / apiGetService / apiRevoke（服务注册闭环）
-//!   下一步: mountPlugin / unmountPlugin（真 dlopen 一个 .so）
+//!          mountPlugin / unmountPlugin（真 dlopen 一个 .so）
+//!   下一步: 工具插件搬家（agent/tools.zig 的四件套搬进 .so）
 //!   推迟:   apiOnEvent（事件总线第二批）、依赖门（settle）、隔离作用域
+//!
+//! 已知待决问题（等第一个真实的消费者插件出现再定，现在不拍脑袋设计）
+//! ---------------------------------------------------------------------------
+//!   `get_service` 只返回接口表（iface），而调用一个方法还需要提供者的实例
+//!   指针（impl）。现在是宿主侧直接从表里取 impl 来调用。等真有插件要消费
+//!   别人的服务时，再决定是让 get_service 返回 { iface, impl } 还是让接口
+//!   结构体自带 impl 字段。
 
 const std = @import("std");
 const abi = @import("dsh_abi");
 const fiber_mod = @import("fiber.zig");
 const services = @import("services.zig");
+const loader = @import("loader.zig");
 
 /// 交给某个插件的私有包装。
 ///
@@ -122,6 +131,67 @@ pub const Context = struct {
 
         try self.slots.append(self.gpa, slot);
         return slot;
+    }
+
+    // ── 宿主侧的挂载 / 卸载入口 ─────────────────────────────────────────────
+
+    pub const MountResult = union(enum) {
+        ok: *PluginSlot,
+        /// 加载失败。fiber 已经在 load 内部完整回滚过，也已经从表里摘掉，
+        /// 调用方什么都不用收拾。
+        failed: abi.Status,
+    };
+
+    /// 挂载一个插件：分配编号 -> 建 fiber + slot -> dlopen + init -> 完成。
+    ///
+    /// 失败时**不留半个插件**：load 内部已经跑完撤销清单、dlclose、清 arena，
+    /// 这里只负责把它从登记表里摘干净。
+    pub fn mountPlugin(
+        self: *Context,
+        path: []const u8,
+        config_json: [:0]const u8,
+    ) MountResult {
+        const slot = self.newFiber(loader.nameFromPath(path), path) catch
+            return .{ .failed = .err_oom };
+
+        const st = slot.fiber.load(&slot.api, config_json);
+        if (st != .ok) {
+            self.dropFiber(slot.fiber);
+            self.dropSlot(slot);
+            return .{ .failed = st };
+        }
+        return .{ .ok = slot };
+    }
+
+    /// 卸载一个插件：撤销全部注册 -> dlclose -> 释放 arena -> 摘表 -> 销毁 slot。
+    /// （前两步在 fiber.unload 里，顺序铁律见 fiber.zig 文件头。）
+    pub fn unmountPlugin(self: *Context, slot: *PluginSlot) void {
+        self.dropFiber(slot.fiber);
+        self.dropSlot(slot);
+    }
+
+    /// 把 fiber 从登记表摘掉并销毁它（deinit 内部会 unload）。
+    fn dropFiber(self: *Context, f: *fiber_mod.Fiber) void {
+        for (self.fibers.items, 0..) |x, i| {
+            if (x == f) {
+                _ = self.fibers.orderedRemove(i);
+                break;
+            }
+        }
+        f.deinit();
+    }
+
+    /// 把 slot 从登记表摘掉并释放。
+    /// ⚠️ 必须在 dropFiber **之后**调用：fiber 销毁后 slot.fiber 就是悬垂指针，
+    ///    这里不能再读它。
+    fn dropSlot(self: *Context, slot: *PluginSlot) void {
+        for (self.slots.items, 0..) |s, i| {
+            if (s == slot) {
+                _ = self.slots.orderedRemove(i);
+                break;
+            }
+        }
+        self.gpa.destroy(slot);
     }
 
     // ───────────────────────────────────────────────────────────────────────
