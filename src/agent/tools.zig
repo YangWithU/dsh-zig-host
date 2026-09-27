@@ -13,10 +13,11 @@
 //! 不可简化: 参数不能改成 Zig 结构体直接传（将来跨 C ABI 只能传字符串），
 //!           结果也不能由工具自己持有（见不变量②）。破坏任一条，搬进插件即返工。
 //!
-//! 与 src/plugins/tools.zig 的关系: 那份是「插件版」（含 ToolsIface 服务表），
-//! 本文件是「MVP 版」（工具直接编进宿主、放在一个数组里）。ToolSpec /
-//! ToolExecuteFn / Buffer 的形状必须一致；阶段 5 做插件时以本文件为唯一定义源，
-//! plugins/tools.zig 改为 import 这里，不要再抄一份（两份定义 = 两份真相）。
+//! 与 src/plugins/tools.zig 的关系: 那份是「插件版」（跑在 .so 里，能力全部经由
+//! HostApi），本文件是「MVP 版」（实现直接编进宿主）。跨边界的形状（Buffer /
+//! ToolSpec / ToolExecuteFn）两边共享 src/tool_api.zig 那一份定义，不各写一遍。
+//! 两份「实现」并存是搬家过程中的过渡状态：等 agent loop 改成从服务表取工具，
+//! 本文件的实现就删掉，只留下被 agent 侧直接引用的那个 `all` 表。
 //!
 //! 注意：本模块被设计成「将来会被整体搬进 .so」，所以它对外只依赖 Host 这个
 //!       窄接口 + 一个调用方给的缓冲区，不依赖任何宿主内部类型。
@@ -24,55 +25,14 @@
 const std = @import("std");
 const abi = @import("dsh_abi");
 
-// ───────────────────────────────────────────────────────────────────────────
-//  跨边界的数据形状（将来搬进 .so 后原样可用）
-// ───────────────────────────────────────────────────────────────────────────
-
-/// 结果缓冲区：**谁调用谁分配**，工具只负责往里写。
-///
-/// 为什么不让工具返回自己分配的内存：插件卸载时 arena 整体清空，宿主手里
-/// 那块当场悬空。所以所有权必须从一开始就在调用方。
-pub const Buffer = extern struct {
-    ptr: ?[*]u8 = null,
-    len: usize = 0,
-    cap: usize = 0,
-
-    pub fn slice(self: *const Buffer) []const u8 {
-        const p = self.ptr orelse return &.{};
-        return p[0..self.len];
-    }
-
-    /// 一个「写满即停」的 writer。写完后用 finish 记录长度。
-    pub fn writer(self: *Buffer) std.Io.Writer {
-        const p = self.ptr orelse return .fixed(&.{});
-        return .fixed(p[0..self.cap]);
-    }
-
-    pub fn finish(self: *Buffer, w: *std.Io.Writer) void {
-        self.len = w.buffered().len;
-    }
-};
-
-/// 工具的对外描述。`parameters_json` 是 JSON Schema 文本，直接塞进请求体的
-/// `tools[].function.parameters` —— 所以字段名必须与 schema 里写的完全一致。
-pub const ToolSpec = extern struct {
-    name: [*:0]const u8,
-    description: [*:0]const u8,
-    parameters_json: [*:0]const u8,
-};
-
-/// 工具执行入口。**形状与将来跨 C ABI 调用时完全一致**，不要改成 Zig 风格：
-/// 参数是 JSON 文本、结果写进 out、失败用 Status 表达，绝不跨边界抛 error。
-pub const ToolExecuteFn = *const fn (
-    impl: *anyopaque,
-    args_json: [*:0]const u8,
-    out: *Buffer,
-) callconv(.c) abi.Status;
-
-pub const Tool = struct {
-    spec: ToolSpec,
-    exec: ToolExecuteFn,
-};
+// ── 跨边界形状：宿主与工具插件共享同一份定义（模块 dsh_tools）──
+// 这里 re-export 而不是重新定义：两份定义迟早漂移，而漂移的表现不是编译错误、
+// 是运行时读到垃圾。插件（plugins/tools.zig）import 的也是这一份。
+const tool_api = @import("dsh_tools");
+pub const Buffer = tool_api.Buffer;
+pub const ToolSpec = tool_api.ToolSpec;
+pub const ToolExecuteFn = tool_api.ToolExecuteFn;
+pub const Tool = tool_api.Tool;
 
 // ───────────────────────────────────────────────────────────────────────────
 //  Host：工具能用到的全部外部能力（窄接口）
@@ -100,37 +60,13 @@ pub const Host = struct {
 //  工具表
 // ───────────────────────────────────────────────────────────────────────────
 
-const read_spec = ToolSpec{
-    .name = "read",
-    .description = "Read a file. Output is line-numbered as `<n>\\t<text>`.",
-    .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"offset":{"type":"integer","description":"1-based line number to start from"},"limit":{"type":"integer","description":"Max number of lines to return"}},"required":["path"]}
-    ,
-};
-
-const write_spec = ToolSpec{
-    .name = "write",
-    .description = "Write a file, overwriting it if it exists. Creates parent directories? No.",
-    .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"File path"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}
-    ,
-};
-
-const edit_spec = ToolSpec{
-    .name = "edit",
-    .description = "Replace the first occurrence of oldText with newText. oldText must appear exactly once, otherwise the edit is refused.",
-    .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"File path"},"oldText":{"type":"string","description":"Exact text to replace; must occur exactly once"},"newText":{"type":"string","description":"Replacement text"}},"required":["path","oldText","newText"]}
-    ,
-};
-
-const bash_spec = ToolSpec{
-    .name = "bash",
-    .description = "Run a shell command with `bash -lc`, returning its stdout/stderr and exit code.",
-    .parameters_json =
-    \\{"type":"object","properties":{"command":{"type":"string","description":"Shell command"},"timeoutSeconds":{"type":"integer","description":"Kill the command after this many seconds"}},"required":["command"]}
-    ,
-};
+// 四个工具的对外描述与工具插件共享同一份（见 src/tool_api.zig）。
+// 这里只做别名，不再各写一遍：description 与 JSON Schema 都是长文本，
+// 两边漂移了编译器不会提示，而模型看到的行为已经不一样了。
+const read_spec = tool_api.read_spec;
+const write_spec = tool_api.write_spec;
+const edit_spec = tool_api.edit_spec;
+const bash_spec = tool_api.bash_spec;
 
 pub const all = [_]Tool{
     .{ .spec = read_spec, .exec = toolRead },

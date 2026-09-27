@@ -15,12 +15,14 @@
 const std = @import("std");
 const abi = @import("dsh_abi");
 const greeter = @import("dsh_greeter");
+const tool_api = @import("dsh_tools");
 const fiber_mod = @import("fiber.zig");
 const context_mod = @import("context.zig");
 const Context = context_mod.Context;
 const PluginSlot = context_mod.PluginSlot;
 
 const hello_path = "zig-out/lib/libhello.so";
+const tools_path = "zig-out/lib/libtools.so";
 
 /// hello.zig 里的 GREET_MAGIC，两边必须一致。
 /// 写死而不是从插件 import：宿主编译期不认识插件代码，这正是动态加载的意义。
@@ -135,4 +137,145 @@ test "同一个 .so 挂两份：第二份因同名服务被拒 -> 加载失败 -
     ctx.unmountPlugin(a);
     try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
     try std.testing.expectEqual(@as(usize, 0), ctx.fibers.items.len);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  tools 插件：四个工具真的跑在 .so 里
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 从服务表拿工具接口。
+/// 按接口约定，第一个字段就是 impl（提供者实例）—— 所以一句就能拿到两个东西。
+fn getTools(ctx: *Context) !*const tool_api.ToolsIface {
+    const raw = ctx.registry.get(tool_api.SERVICE_NAME, 0) orelse return error.NoToolsService;
+    return @ptrCast(@alignCast(raw));
+}
+
+test "tools 插件：列得出四个工具，且四个都真能执行" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    _ = try mountOrFail(&ctx, tools_path);
+    const tools = try getTools(&ctx);
+
+    // ① 列表：宿主拿到的只有指针，名字与 Schema 全从插件里读
+    try std.testing.expectEqual(@as(usize, 4), tools.count(tools.impl));
+    var names: [4][]const u8 = undefined;
+    for (0..4) |i| {
+        const spec = tools.at(tools.impl, i).?;
+        names[i] = std.mem.span(spec.name);
+        try std.testing.expect(std.mem.span(spec.description).len > 0);
+        try std.testing.expect(std.mem.span(spec.parameters_json).len > 0);
+    }
+    try std.testing.expectEqualStrings("read", names[0]);
+    try std.testing.expectEqualStrings("write", names[1]);
+    try std.testing.expectEqualStrings("edit", names[2]);
+    try std.testing.expectEqualStrings("bash", names[3]);
+    try std.testing.expect(tools.at(tools.impl, 4) == null);
+
+    // ② 执行：四个工具依次真跑一遍（全部经由 HostApi 的能力）
+    const path = "/tmp/dsh-tools-plugin-test.txt";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var out: tool_api.Buffer = .{ .ptr = &buf, .cap = buf.len };
+
+    out.len = 0;
+    try std.testing.expectEqual(abi.Status.ok, tools.execute(
+        tools.impl,
+        "write",
+        "{\"path\":\"" ++ path ++ "\",\"content\":\"alpha\\nbeta\\n\"}",
+        &out,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, out.slice(), "已写入") != null);
+
+    out.len = 0;
+    try std.testing.expectEqual(abi.Status.ok, tools.execute(
+        tools.impl,
+        "read",
+        "{\"path\":\"" ++ path ++ "\"}",
+        &out,
+    ));
+    // 行号格式来自插件里的实现，不是宿主拼的
+    try std.testing.expect(std.mem.indexOf(u8, out.slice(), "1\talpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.slice(), "2\tbeta") != null);
+
+    out.len = 0;
+    try std.testing.expectEqual(abi.Status.ok, tools.execute(
+        tools.impl,
+        "edit",
+        "{\"path\":\"" ++ path ++ "\",\"oldText\":\"beta\",\"newText\":\"BETA\"}",
+        &out,
+    ));
+
+    out.len = 0;
+    try std.testing.expectEqual(abi.Status.ok, tools.execute(
+        tools.impl,
+        "read",
+        "{\"path\":\"" ++ path ++ "\"}",
+        &out,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, out.slice(), "BETA") != null);
+
+    out.len = 0;
+    try std.testing.expectEqual(abi.Status.ok, tools.execute(
+        tools.impl,
+        "bash",
+        "{\"command\":\"echo from-plugin\"}",
+        &out,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, out.slice(), "from-plugin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.slice(), "[exit 0]") != null);
+
+    // ③ 未知工具：不崩，把原因写进 out 让模型看到
+    out.len = 0;
+    try std.testing.expect(tools.execute(tools.impl, "frobnicate", "{}", &out) != .ok);
+    try std.testing.expect(std.mem.indexOf(u8, out.slice(), "未知工具") != null);
+
+    // ④ 参数不合法：同样不崩
+    out.len = 0;
+    try std.testing.expect(tools.execute(tools.impl, "read", "not json", &out) != .ok);
+    try std.testing.expect(out.slice().len > 0);
+}
+
+test "tools 插件：卸载后服务消失、登记表清零" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    const slot = try mountOrFail(&ctx, tools_path);
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.count());
+    try std.testing.expectEqual(@as(usize, 1), slot.fiber.disposers.items.len);
+
+    ctx.unmountPlugin(slot);
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
+    try std.testing.expect(ctx.registry.get(tool_api.SERVICE_NAME, 0) == null);
+    try std.testing.expectEqual(@as(usize, 0), ctx.fibers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.slots.items.len);
+}
+
+test "tools 插件：反复装卸 10 次，每次都能重新拿到可用的工具表" {
+    const gpa = std.testing.allocator;
+    var ctx = Context.init(gpa, std.testing.io);
+    defer ctx.deinit();
+
+    for (0..10) |_| {
+        const slot = try mountOrFail(&ctx, tools_path);
+        const tools = try getTools(&ctx);
+        try std.testing.expectEqual(@as(usize, 4), tools.count(tools.impl));
+
+        var buf: [512]u8 = undefined;
+        var out: tool_api.Buffer = .{ .ptr = &buf, .cap = buf.len };
+        try std.testing.expectEqual(abi.Status.ok, tools.execute(
+            tools.impl,
+            "bash",
+            "{\"command\":\"echo again\"}",
+            &out,
+        ));
+        try std.testing.expect(std.mem.indexOf(u8, out.slice(), "again") != null);
+
+        ctx.unmountPlugin(slot);
+        try std.testing.expectEqual(@as(usize, 0), ctx.registry.count());
+    }
 }

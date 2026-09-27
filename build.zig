@@ -35,6 +35,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // 工具能力的跨边界形状：宿主与工具插件共享同一份（见 src/tool_api.zig）。
+    const tools_api_mod = b.addModule("dsh_tools", .{
+        .root_source_file = b.path("src/tool_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "dsh_abi", .module = abi_mod },
+        },
+    });
+
     // 示例服务接口：宿主与用它的插件共享同一份类型定义。
     // 单独成模块，而不是塑进 dsh_abi —— dsh_abi 只放每个插件都要用的通用
     // 契约（Handle / Status / HostApi），具体服务的接口布局各自成模块，
@@ -54,6 +64,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "dsh_abi", .module = abi_mod },
+            .{ .name = "dsh_tools", .module = tools_api_mod },
         },
     });
     // 决策 2：必须链 libc，否则动态加载会段错误（见文件头说明）
@@ -81,6 +92,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "dsh_abi", .module = abi_mod },
                 .{ .name = "dsh_greeter", .module = greeter_mod },
+                .{ .name = "dsh_tools", .module = tools_api_mod },
             },
         });
         pmod.link_libc = true;
@@ -120,6 +132,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "dsh_abi", .module = abi_mod },
+            .{ .name = "dsh_tools", .module = tools_api_mod },
         },
     });
     agent_test_mod.link_libc = true;
@@ -137,6 +150,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "dsh_abi", .module = abi_mod },
             .{ .name = "dsh_greeter", .module = greeter_mod },
+            .{ .name = "dsh_tools", .module = tools_api_mod },
         },
     });
     host_test_mod.link_libc = true;
